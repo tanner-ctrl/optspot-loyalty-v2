@@ -135,6 +135,46 @@ def auto_match(file_cols, schema_field):
     return None
 
 
+def _render_login():
+    st.markdown("""
+    <style>
+    .login-wrap {
+        display: flex; justify-content: center; margin-top: 80px;
+    }
+    .login-card {
+        background: #0d2b4e; border-radius: 12px; padding: 40px 48px;
+        width: 360px; box-shadow: 0 4px 24px rgba(0,0,0,0.25);
+        text-align: center;
+    }
+    .login-card h2 { color: #5bc4f5; margin: 0 0 4px 0; font-size: 22px; font-weight: 700; }
+    .login-card p  { color: #a8c8e8; margin: 0 0 28px 0; font-size: 14px; }
+    </style>
+    <div class="login-wrap">
+      <div class="login-card">
+        <h2>OptSpot Loyalty</h2>
+        <p>Analytics Dashboard</p>
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    _, col, _ = st.columns([1, 1.2, 1])
+    with col:
+        pw = st.text_input("Password", type="password", label_visibility="collapsed",
+                           placeholder="Enter password")
+        if st.button("Enter", use_container_width=True, type="primary"):
+            correct = "demo-password"
+            try:
+                if "APP_PASSWORD" in st.secrets:
+                    correct = st.secrets["APP_PASSWORD"]
+            except Exception:
+                pass
+            if pw == correct:
+                st.session_state["authenticated"] = True
+                st.rerun()
+            else:
+                st.error("Incorrect password.")
+
+
 # Auto-load sample data once per session
 if "loaded_data" not in st.session_state:
     sample_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sample_data.csv")
@@ -146,6 +186,11 @@ if "loaded_data" not in st.session_state:
     else:
         st.session_state["loaded_data"] = None
         st.session_state["auto_loaded"] = False
+
+# ── Auth gate ─────────────────────────────────────────────────────────────────
+if not st.session_state.get("authenticated"):
+    _render_login()
+    st.stop()
 
 
 def render_status_line():
@@ -167,6 +212,11 @@ page = st.sidebar.radio(
 
 if st.session_state.get("auto_loaded"):
     st.sidebar.caption("Sample data loaded automatically. Use Import Files to replace.")
+
+st.sidebar.markdown("---")
+if st.sidebar.button("Log out"):
+    st.session_state["authenticated"] = False
+    st.rerun()
 
 
 # ── Page functions ────────────────────────────────────────────────────────────
@@ -1817,23 +1867,101 @@ def page_import():
         msg = st.session_state["import_success_msg"]
         del st.session_state["import_success_msg"]
         st.success(msg)
+        if "import_source_files" in st.session_state:
+            st.caption(f"Source files: {st.session_state.pop('import_source_files')}")
 
-    uploaded = st.file_uploader("Upload a CSV file", type=["csv"])
+    uploaded_files = st.file_uploader(
+        "Upload one or more CSV files",
+        type=["csv"],
+        accept_multiple_files=True,
+        help="All files must have the same column structure. Rows from all files will be merged.",
+    )
 
-    if uploaded is None:
+    if not uploaded_files:
         return
 
-    df_raw = pd.read_csv(uploaded, index_col=False)
-    df_raw = df_raw.dropna(axis=1, how="all")
+    # ── Read all files ────────────────────────────────────────────────────────
+    dfs = []
+    for f in uploaded_files:
+        try:
+            df = pd.read_csv(f, index_col=False)
+            df = df.dropna(axis=1, how="all")
+            dfs.append((f.name, df))
+        except Exception:
+            st.warning(f"Could not read **{f.name}** — skipping.")
 
-    st.write(f"**{uploaded.name}** — {len(df_raw):,} rows")
-    st.write("**Preview (first 5 rows):**")
-    st.dataframe(df_raw.head(5), use_container_width=True)
+    if not dfs:
+        st.error("No files could be read. Check that all uploads are valid CSVs.")
+        return
 
+    # ── Per-file summary ──────────────────────────────────────────────────────
+    ref_cols = set(dfs[0][1].columns.str.lower())
+    total_rows = sum(len(df) for _, df in dfs)
+
+    rows_html = ""
+    for name, df in dfs:
+        file_cols_set = set(df.columns.str.lower())
+        if file_cols_set == ref_cols or len(dfs) == 1:
+            status = '<span style="color:#2e7d32;">✓</span>'
+        else:
+            status = '<span style="color:#c62828;" title="Column headers differ from first file">⚠ Different columns</span>'
+        rows_html += (
+            f"<tr><td style='padding:4px 10px 4px 0;'>{_html.escape(name)}</td>"
+            f"<td style='padding:4px 10px 4px 0;text-align:right;'>{len(df):,}</td>"
+            f"<td style='padding:4px 10px 4px 0;text-align:right;'>{len(df.columns)}</td>"
+            f"<td style='padding:4px 0;'>{status}</td></tr>"
+        )
+    st.markdown(
+        f"""<table style="font-size:13px;border-collapse:collapse;width:auto;">
+          <thead><tr>
+            <th style="padding:4px 10px 4px 0;text-align:left;color:#555;">File</th>
+            <th style="padding:4px 10px 4px 0;text-align:right;color:#555;">Rows</th>
+            <th style="padding:4px 10px 4px 0;text-align:right;color:#555;">Cols</th>
+            <th style="padding:4px 0;color:#555;">Status</th>
+          </tr></thead>
+          <tbody>{rows_html}</tbody>
+        </table>""",
+        unsafe_allow_html=True,
+    )
+    n = len(dfs)
+    st.caption(f"{n} file{'s' if n > 1 else ''} • {total_rows:,} total rows")
+
+    # ── Schema validation (skip for single file) ──────────────────────────────
+    if len(dfs) > 1:
+        mismatches = [
+            (name, df.columns.tolist())
+            for name, df in dfs[1:]
+            if set(df.columns.str.lower()) != ref_cols
+        ]
+        if mismatches:
+            st.error(
+                "These files have different column structures. "
+                "Fix or remove the mismatched ones before continuing."
+            )
+            for name, cols in mismatches:
+                their_cols = set(c.lower() for c in cols)
+                only_ref   = ref_cols - their_cols
+                only_theirs = their_cols - ref_cols
+                diff_parts = []
+                if only_ref:
+                    diff_parts.append(f"missing: {', '.join(sorted(only_ref))}")
+                if only_theirs:
+                    diff_parts.append(f"extra: {', '.join(sorted(only_theirs))}")
+                st.caption(f"**{name}** — {'; '.join(diff_parts)}")
+            return
+
+    # ── Preview from first file ───────────────────────────────────────────────
+    first_name, first_df = dfs[0]
     st.subheader("Column Mapping")
-    st.write("Map your file's columns to the OptSpot schema. Auto-matched where column names align.")
+    st.write(
+        f"Preview from **{first_name}** "
+        f"(rows from all files will be processed the same way)."
+    )
+    st.dataframe(first_df.head(5), use_container_width=True)
 
-    file_cols = list(df_raw.columns)
+    st.write("Map columns to the OptSpot schema. Auto-matched where column names align.")
+
+    file_cols = list(first_df.columns)
     col_left, col_right = st.columns(2)
     mapping = {}
 
@@ -1869,7 +1997,8 @@ def page_import():
             st.error("Map at least one column before importing.")
             return
 
-        mapped_df = pd.DataFrame({field: df_raw[col] for field, col in mapping.items()})
+        combined  = pd.concat([df for _, df in dfs], ignore_index=True)
+        mapped_df = pd.DataFrame({field: combined[col] for field, col in mapping.items()})
         mapped_df = split_datetime_column(mapped_df)
 
         existing = st.session_state.get("loaded_data")
@@ -1878,8 +2007,13 @@ def page_import():
         else:
             st.session_state["loaded_data"] = mapped_df
 
-        st.session_state["auto_loaded"] = False
-        st.session_state["import_success_msg"] = f"Imported {len(mapped_df):,} rows successfully."
+        n_files = len(dfs)
+        st.session_state["auto_loaded"]        = False
+        st.session_state["import_success_msg"] = (
+            f"Imported {len(mapped_df):,} rows from "
+            f"{n_files} file{'s' if n_files > 1 else ''}."
+        )
+        st.session_state["import_source_files"] = ", ".join(name for name, _ in dfs)
         st.rerun()
 
 
