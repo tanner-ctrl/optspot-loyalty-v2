@@ -10,18 +10,6 @@ import streamlit as st
 
 st.set_page_config(page_title="OptSpot Loyalty Analytics", layout="wide")
 
-ACTION_LABELS = {
-    "CHECKIN":  "Visited",
-    "REDEEM":   "Redeemed Reward",
-    "BONUS":    "Earned Bonus Points",
-    "REFERRAL": "Referred a Friend",
-    "JOINED":   "Joined Loyalty Program",
-    "VISITED":  "Visited",
-    "LOYALTY GOAL REACHED":    "Reached Loyalty Goal",
-    "KIOSK ENTRY PROCESSED":   "Earned Points",
-    "KIOSK ENTRY PROCESSED - RE-CALCULATE THE LOYALTY POINT BALANCE": "Earned Points",
-}
-
 SCHEMA_FIELDS = [
     "Location",
     "Mobile",
@@ -32,6 +20,23 @@ SCHEMA_FIELDS = [
     "Total Points",
     "License Plate",
 ]
+
+OPTIONAL_SCHEMA_FIELDS = {"Time", "Total Points", "License Plate"}
+
+SCHEMA_DISPLAY = {
+    "Points Awarded": "Points Awarded This Visit",
+}
+
+COLUMN_ALIASES = {
+    "Location":      ["location", "kiosk"],
+    "Mobile":        ["mobile", "phone"],
+    "Action":        ["action"],
+    "Date":          ["date"],
+    "Points Awarded":["points awarded", "data1"],
+    "Total Points":  ["total points", "data2"],
+    "Time":          ["time"],
+    "License Plate": ["license plate", "data3"],
+}
 
 FILTER_DEFAULTS = {
     "filter_preset":      "All time",
@@ -45,9 +50,28 @@ FILTER_DEFAULTS = {
 }
 
 
-def resolve_action_label(raw):
-    cleaned = _html.unescape(str(raw)).replace("\xa0", " ").strip().upper()
-    return ACTION_LABELS.get(cleaned, str(raw).strip().title())
+def parse_action_label(raw):
+    if not raw or pd.isna(raw):
+        return "Unknown"
+    cleaned = _html.unescape(str(raw)).replace("\xa0", " ").strip()
+    lowered = cleaned.lower()
+
+    if "user joins loyalty program" in lowered or "joined" in lowered:
+        return "Joined Loyalty Program"
+    if "goal not reached" in lowered:
+        return "Visited"
+    if "goal reached" in lowered or "loyalty goal" in lowered:
+        return "Reached Loyalty Goal"
+    if "redemption" in lowered or "redeem" in lowered:
+        return "Redeemed Reward"
+    if "referral" in lowered or "referred" in lowered:
+        return "Referred a Friend"
+    if "bonus" in lowered:
+        return "Earned Bonus Points"
+    if "checkin" in lowered or "check in" in lowered or "check-in" in lowered:
+        return "Visited"
+    first_segment = cleaned.split(" - ")[0].strip()
+    return first_segment.title()[:50]
 
 
 def render_action_distribution(df):
@@ -58,7 +82,7 @@ def render_action_distribution(df):
 
     merged: dict = {}
     for raw, count in raw_counts.items():
-        label = resolve_action_label(raw)
+        label = parse_action_label(raw)
         merged[label] = merged.get(label, 0) + int(count)
 
     rows      = sorted(merged.items(), key=lambda x: x[1], reverse=True)
@@ -87,9 +111,26 @@ def render_action_distribution(df):
     st.markdown("".join(parts), unsafe_allow_html=True)
 
 
+def split_datetime_column(df):
+    if "Date" not in df.columns:
+        return df
+    parsed = pd.to_datetime(df["Date"], errors="coerce")
+    if parsed.isna().all():
+        return df
+    has_time = parsed.dt.hour.any() or parsed.dt.minute.any() or parsed.dt.second.any()
+    if not has_time:
+        return df
+    df = df.copy()
+    df["Date"] = parsed.dt.strftime("%Y-%m-%d")
+    if "Time" not in df.columns:
+        df["Time"] = parsed.dt.strftime("%H:%M:%S")
+    return df
+
+
 def auto_match(file_cols, schema_field):
+    aliases = [a.lower() for a in COLUMN_ALIASES.get(schema_field, [schema_field.lower()])]
     for col in file_cols:
-        if col.strip().lower() == schema_field.lower():
+        if col.strip().lower() in aliases:
             return col
     return None
 
@@ -98,7 +139,9 @@ def auto_match(file_cols, schema_field):
 if "loaded_data" not in st.session_state:
     sample_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sample_data.csv")
     if os.path.exists(sample_path):
-        st.session_state["loaded_data"] = pd.read_csv(sample_path)
+        _df = pd.read_csv(sample_path, index_col=False)
+        _df = _df.dropna(axis=1, how="all")
+        st.session_state["loaded_data"] = split_datetime_column(_df)
         st.session_state["auto_loaded"] = True
     else:
         st.session_state["loaded_data"] = None
@@ -294,6 +337,17 @@ def popular_times_insight(counts):
     total = counts.sum()
     if total == 0:
         return ""
+
+    peak_bin   = int(counts.idxmax())
+    peak_count = int(counts.max())
+    peak_pct   = peak_count / total * 100
+    if peak_pct > 40:
+        return (
+            f"Concentration peak: {bin_to_range_label(peak_bin)}, with {peak_count:,} visits "
+            f"({peak_pct:.0f}% of all activity in that single 30-minute window). "
+            "This is unusual — verify your kiosk isn't batching events at the top of the hour."
+        )
+
     evening = counts[counts.index.isin(range(960, 1200, 30))].sum()  # 4 PM–8 PM
     morning = counts[counts.index.isin(range(420,  660, 30))].sum()  # 7 AM–11 AM
     if evening / total >= 0.60:
@@ -531,14 +585,156 @@ def render_cohort_heatmap(df):
         use_container_width=True,
     )
 
-    st.markdown(
-        "- **Acquisition Quality:** A darker Month 0 column means that cohort's customers "
-        "were higher quality — maybe a stronger promo or a busier season brought them in.\n"
-        "- **The Cliff:** Most drop-off happens between Month 0 and Month 1. "
-        "Target ghost customers with an automated offer sent 3–4 weeks after their first visit.\n"
-        "- **Seasonal Drift:** Compare summer joiners to winter joiners — "
-        "car wash habits differ by season, so retention rates may too."
+    render_cohort_panels(pct_pivot, cohort_sizes)
+
+
+def render_cohort_panels(pct_pivot, cohort_sizes):
+    valid   = cohort_sizes[cohort_sizes >= 5].index
+    offsets = sorted(pct_pivot.columns)
+
+    # Average retention per offset (need ≥2 cohorts contributing)
+    avg = {}
+    for off in offsets:
+        vals = pct_pivot.loc[pct_pivot.index.isin(valid), off].dropna()
+        if len(vals) >= 2:
+            avg[off] = float(vals.mean())
+
+    # Biggest consecutive drop
+    sorted_offs = sorted(avg.keys())
+    cliff_x = cliff_y = None
+    biggest_drop = 0.0
+    for i in range(len(sorted_offs) - 1):
+        x, y = sorted_offs[i], sorted_offs[i + 1]
+        drop = avg[x] - avg[y]
+        if drop > biggest_drop:
+            biggest_drop, cliff_x, cliff_y = drop, x, y
+
+    # Best acquisition cohort (highest Month 1 retention)
+    best_cohort_str = best_pct = None
+    if 1 in pct_pivot.columns:
+        m1_valid = pct_pivot.loc[pct_pivot.index.isin(valid), 1].dropna()
+        if len(m1_valid):
+            best_cohort_str = m1_valid.idxmax().strftime("%B %Y")
+            best_pct        = float(m1_valid.max())
+
+    # Cliff severity language
+    avg_m1    = avg.get(1)
+    avg_m0    = avg.get(0, 100.0)
+    cliff_txt = None
+    if avg_m1 is not None:
+        churn_pct = avg_m0 - avg_m1
+        if churn_pct > 60:
+            tone = "That's a steep cliff."
+        elif churn_pct >= 40:
+            tone = "There's room to grow here."
+        else:
+            tone = "Your retention is healthier than typical car wash loyalty programs."
+        cliff_txt = (
+            f"On average, {churn_pct:.0f}% of new customers don't come back after their "
+            f"first month. {tone} An automated welcome-back text at day 14–21 could "
+            "meaningfully change this number."
+        )
+
+    CARD = (
+        "background:#f0f7ff;border-left:4px solid #3d85c8;border-radius:4px;"
+        "padding:16px 20px;color:#0a2540;"
     )
+    ROW  = "display:flex;justify-content:space-between;font-size:12px;padding:4px 0;"
+    SEP  = "border-top:1px solid #d0dff0;margin:6px 0;"
+
+    # ── LEFT PANEL ────────────────────────────────────────────────────────────
+    if cliff_x is not None and cliff_y is not None:
+        subtitle = (
+            f"Aggregate retention across all cohorts suggests your program's stickiness "
+            f"drops most between Month {cliff_x} and Month {cliff_y}."
+        )
+    elif len(avg) >= 1:
+        subtitle = "Aggregate retention across cohorts with at least 5 joiners."
+    else:
+        subtitle = "Not enough cohort data yet to compute averages."
+
+    rows_html = ""
+    for off in sorted_offs:
+        val      = avg[off]
+        is_cliff = (off == cliff_x)
+        weight   = "font-weight:700;" if is_cliff else ""
+        bg       = "background:#dceeff;border-radius:3px;padding:2px 4px;" if is_cliff else ""
+        rows_html += (
+            f'<div style="{ROW}{weight}{bg}">'
+            f'<span>RETENTION @ MONTH {off}</span>'
+            f'<span>{val:.1f}%</span>'
+            f'</div>'
+        )
+
+    left_html = f"""
+    <div style="{CARD}">
+      <p style="font-weight:700;font-size:14px;margin:0 0 4px 0;color:#061a2d;">
+        Average Cohort Performance
+      </p>
+      <p style="font-size:12px;margin:0 0 12px 0;color:#3a5a7a;">
+        {_html.escape(subtitle)}
+      </p>
+      <div style="{SEP}"></div>
+      {rows_html if rows_html else
+       '<p style="font-size:12px;color:#888;">Not enough data yet.</p>'}
+    </div>
+    """
+
+    # ── RIGHT PANEL ───────────────────────────────────────────────────────────
+    if best_cohort_str and best_pct is not None:
+        acq_txt = (
+            f"Your strongest cohort was <b>{_html.escape(best_cohort_str)}</b> joiners, "
+            f"with <b>{best_pct:.0f}%</b> returning in Month 1. Look at what was different "
+            "about that month — promo, weather, season — and replicate it."
+        )
+    else:
+        acq_txt = (
+            "Not enough history yet. Once a cohort reaches Month 1, "
+            "the strongest acquisition month will show here."
+        )
+
+    cliff_body = (
+        _html.escape(cliff_txt).replace("&amp;", "&")
+        if cliff_txt
+        else "Not enough data yet to compute the Month 0 → Month 1 drop."
+    )
+
+    seasonal_txt = (
+        "Compare summer joiners to winter joiners. Car wash frequency tends to spike "
+        "in spring and fall as drivers fight pollen and road salt. If your spring cohorts "
+        "retain better than your summer ones, that's the pattern at work — and a signal "
+        "to push harder during peak seasons."
+    )
+
+    right_html = f"""
+    <div style="{CARD}">
+      <p style="font-weight:700;font-size:14px;margin:0 0 12px 0;color:#061a2d;">
+        Retention Key Insights
+      </p>
+
+      <p style="font-size:11px;font-weight:700;letter-spacing:0.04em;
+                margin:0 0 3px 0;color:#1a4f7a;">ACQUISITION QUALITY</p>
+      <p style="font-size:12px;margin:0 0 12px 0;">{acq_txt}</p>
+
+      <div style="{SEP}"></div>
+
+      <p style="font-size:11px;font-weight:700;letter-spacing:0.04em;
+                margin:6px 0 3px 0;color:#1a4f7a;">THE CLIFF</p>
+      <p style="font-size:12px;margin:0 0 12px 0;">{cliff_body}</p>
+
+      <div style="{SEP}"></div>
+
+      <p style="font-size:11px;font-weight:700;letter-spacing:0.04em;
+                margin:6px 0 3px 0;color:#1a4f7a;">SEASONAL DRIFT</p>
+      <p style="font-size:12px;margin:0;">{_html.escape(seasonal_txt)}</p>
+    </div>
+    """
+
+    col_left, col_right = st.columns([1, 1])
+    with col_left:
+        st.markdown(left_html, unsafe_allow_html=True)
+    with col_right:
+        st.markdown(right_html, unsafe_allow_html=True)
 
 
 def compute_tldr(df):
@@ -601,11 +797,33 @@ def compute_tldr(df):
         regular_pct      = (visit_counts >= 3).sum() / total_c * 100 if total_c else 0
         vip_pct          = (visit_counts >= 10).sum() / total_c * 100 if total_c else 0
         vip_count        = int((visit_counts >= 10).sum())
-        bullets.append(
-            f"{one_and_done_pct:.0f}% of your customers visit only once or twice — "
-            f"that's your biggest growth lever. The good news: {regular_pct:.0f}% are "
-            f"loyal regulars (3+ visits) and {vip_pct:.0f}% are VIPs (10+ visits)."
-        )
+        if one_and_done_pct >= 90 and regular_pct <= 5:
+            bullets.append(
+                f"{one_and_done_pct:.0f}% of your customers visit only once or twice — "
+                "and almost none come back. This is the most urgent gap in your loyalty "
+                "program: people are signing up but not returning. The biggest single fix: "
+                "an automated welcome-back text within 14 days."
+            )
+        elif one_and_done_pct >= 70:
+            bullets.append(
+                f"{one_and_done_pct:.0f}% of your customers visit only once or twice — "
+                f"that's your biggest growth lever. You have {regular_pct:.0f}% regulars "
+                f"and {vip_pct:.0f}% VIPs to nurture, but the bigger opportunity is "
+                "converting one-timers into repeat customers."
+            )
+        elif one_and_done_pct >= 50:
+            bullets.append(
+                f"{one_and_done_pct:.0f}% of your customers visit only once or twice — "
+                f"that's your biggest growth lever. The good news: {regular_pct:.0f}% are "
+                f"loyal regulars (3+ visits) and {vip_pct:.0f}% are VIPs (10+ visits)."
+            )
+        else:
+            bullets.append(
+                f"Your loyalty program is working — only {one_and_done_pct:.0f}% of "
+                f"customers visit just once or twice. {regular_pct:.0f}% are regulars "
+                f"and {vip_pct:.0f}% are VIPs. Focus on protecting and rewarding your "
+                "loyal core."
+            )
     else:
         one_and_done_pct = 0
         vip_count        = 0
@@ -621,6 +839,11 @@ def compute_tldr(df):
             f"Your busiest window is {bin_to_range_label(peak_bin)}, with "
             f"{peak_count:,} visits in that slot over the period. "
             "Time promotions to hit that block."
+        )
+    else:
+        bullets.append(
+            "Most loyalty activity happens at your Kiosk — every interaction "
+            "is a chance to convert a one-timer into a regular."
         )
 
     # ── e. Recommended action ─────────────────────────────────────────────────
@@ -712,9 +935,9 @@ def get_filtered_data():
             result = result[dates <= pd.Timestamp(end)]
 
     if labels is not None and "Action" in result.columns:
-        all_lbls = {resolve_action_label(a) for a in df["Action"].dropna().unique()}
+        all_lbls = {parse_action_label(a) for a in df["Action"].dropna().unique()}
         if set(labels) != all_lbls:
-            result = result[result["Action"].apply(resolve_action_label).isin(labels)]
+            result = result[result["Action"].apply(parse_action_label).isin(labels)]
 
     if (min_v or max_v) and "Mobile" in df.columns:
         totals = df.groupby("Mobile").size()
@@ -757,7 +980,7 @@ def build_filter_summary(df_full, df_filtered):
 
     labels = st.session_state.get("filter_actions")
     if labels is not None and "Action" in df_full.columns:
-        all_lbls = {resolve_action_label(a) for a in df_full["Action"].dropna().unique()}
+        all_lbls = {parse_action_label(a) for a in df_full["Action"].dropna().unique()}
         if set(labels) != all_lbls:
             shown = ", ".join(labels[:2]) + (f" +{len(labels)-2} more" if len(labels) > 2 else "")
             parts.append(f"action: {shown}")
@@ -848,7 +1071,7 @@ def render_filters(df):
         st.session_state["filter_date_end"]   = r_end
 
     unique_labels = (
-        sorted({resolve_action_label(a) for a in df["Action"].dropna().unique()})
+        sorted({parse_action_label(a) for a in df["Action"].dropna().unique()})
         if "Action" in df.columns else []
     )
     if st.session_state.get("filter_actions") is None and unique_labels:
@@ -1347,15 +1570,17 @@ def page_dashboard():
 
     labels, counts = aggregate_visits(df_filtered, period)
 
-    median_val = counts.median()
-    max_val    = counts.max()
-    if median_val > 0 and max_val > 3 * median_val:
-        outlier_label = labels[counts.values.argmax()]
-        ratio = round(max_val / median_val, 1)
-        st.info(
-            f"Tip: One period stands out — {outlier_label} had {ratio}x the typical "
-            "volume. Try Log scale to see the rest of the trend more clearly."
-        )
+    sorted_counts = counts.sort_values(ascending=False)
+    if len(sorted_counts) >= 2:
+        max_val    = sorted_counts.iloc[0]
+        second_val = sorted_counts.iloc[1]
+        if second_val > 0 and max_val >= 2 * second_val:
+            outlier_label = labels[counts.values.argmax()]
+            ratio = round(max_val / second_val, 1)
+            st.info(
+                f"Tip: One period stands out — {outlier_label} had {ratio}x the volume "
+                "of the next busiest period. Try Log scale to see the rest of the trend."
+            )
 
     st.plotly_chart(build_activity_chart(labels, counts, log_scale), use_container_width=True)
 
@@ -1380,6 +1605,10 @@ def page_dashboard():
 
     if "Time" in df_filtered.columns:
         render_popular_times(df_filtered)
+    else:
+        st.caption(
+            "Popular Times unavailable — your export doesn't include timestamps."
+        )
 
     if "Mobile" in df_filtered.columns and "Date" in df_filtered.columns:
         render_cohort_heatmap(df_filtered)
@@ -1594,7 +1823,8 @@ def page_import():
     if uploaded is None:
         return
 
-    df_raw = pd.read_csv(uploaded)
+    df_raw = pd.read_csv(uploaded, index_col=False)
+    df_raw = df_raw.dropna(axis=1, how="all")
 
     st.write(f"**{uploaded.name}** — {len(df_raw):,} rows")
     st.write("**Preview (first 5 rows):**")
@@ -1604,17 +1834,25 @@ def page_import():
     st.write("Map your file's columns to the OptSpot schema. Auto-matched where column names align.")
 
     file_cols = list(df_raw.columns)
-    options = ["-- not mapped --"] + file_cols
     col_left, col_right = st.columns(2)
     mapping = {}
 
     for i, field in enumerate(SCHEMA_FIELDS):
-        auto = auto_match(file_cols, field)
-        default_idx = options.index(auto) if auto else 0
-        target_col = col_left if i % 2 == 0 else col_right
+        is_optional   = field in OPTIONAL_SCHEMA_FIELDS
+        placeholder   = "(optional / not available)" if is_optional else "-- not mapped --"
+        display_label = SCHEMA_DISPLAY.get(field, field)
+        options       = [placeholder] + file_cols
+        auto          = auto_match(file_cols, field)
+        default_idx   = options.index(auto) if auto else 0
+        target_col    = col_left if i % 2 == 0 else col_right
         with target_col:
-            selected = st.selectbox(field, options, index=default_idx, key=f"map_{field}")
-            if selected != "-- not mapped --":
+            selected = st.selectbox(
+                display_label,
+                options,
+                index=default_idx,
+                key=f"map_{field}",
+            )
+            if selected not in ("-- not mapped --", "(optional / not available)"):
                 mapping[field] = selected
 
     st.subheader("Import Mode")
@@ -1632,6 +1870,7 @@ def page_import():
             return
 
         mapped_df = pd.DataFrame({field: df_raw[col] for field, col in mapping.items()})
+        mapped_df = split_datetime_column(mapped_df)
 
         existing = st.session_state.get("loaded_data")
         if mode == "Append to existing data" and existing is not None:
