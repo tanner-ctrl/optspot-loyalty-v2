@@ -49,6 +49,7 @@ FILTER_DEFAULTS = {
     "filter_date_start":  None,
     "filter_date_end":    None,
     "filter_actions":     None,
+    "filter_locations":   [],
     "filter_min_visits":  None,
     "filter_max_visits":  None,
     "filter_search":      "",
@@ -402,14 +403,22 @@ def render_location_performance(df):
     n_locs = df["Location"].nunique()
 
     if n_locs < 2:
+        active_locs = st.session_state.get("filter_locations", [])
+        if active_locs and len(active_locs) == 1:
+            msg = (
+                f"Showing single location: {_html.escape(active_locs[0])}. "
+                "Multi-location comparisons unavailable with one kiosk selected — "
+                "clear the Locations filter to see all kiosks compared."
+            )
+        else:
+            msg = (
+                "Only one location detected. Multi-location comparisons appear when "
+                "your data includes multiple kiosks."
+            )
         st.markdown(
-            f"""
-            <div style="background:#f0f7ff;border-left:4px solid {MID_BLUE};
-                        border-radius:4px;padding:14px 20px;color:{PRIMARY_NAVY};font-size:14px;">
-              Only one location detected. Multi-location comparisons appear when
-              your data includes multiple kiosks.
-            </div>
-            """,
+            f'<div style="background:#f0f7ff;border-left:4px solid {MID_BLUE};'
+            f'border-radius:4px;padding:14px 20px;color:{PRIMARY_NAVY};font-size:14px;">'
+            f'{msg}</div>',
             unsafe_allow_html=True,
         )
         return
@@ -1383,6 +1392,10 @@ def get_filtered_data():
         if set(labels) != all_lbls:
             result = result[result["Action"].apply(parse_action_label).isin(labels)]
 
+    locs = st.session_state.get("filter_locations", [])
+    if locs and "Location" in result.columns:
+        result = result[result["Location"].isin(locs)]
+
     if (min_v or max_v) and "Mobile" in df.columns:
         totals = df.groupby("Mobile").size()
         mask   = pd.Series(True, index=totals.index)
@@ -1428,6 +1441,14 @@ def build_filter_summary(df_full, df_filtered):
         if set(labels) != all_lbls:
             shown = ", ".join(labels[:2]) + (f" +{len(labels)-2} more" if len(labels) > 2 else "")
             parts.append(f"action: {shown}")
+
+    locs = st.session_state.get("filter_locations", [])
+    if locs and "Location" in df_full.columns:
+        total_locs = df_full["Location"].nunique()
+        if len(locs) == 1:
+            parts.append(f"location: {locs[0]}")
+        elif len(locs) < total_locs:
+            parts.append(f"{len(locs)} of {total_locs} locations")
 
     search = st.session_state.get("filter_search", "").strip()
     if search:
@@ -1521,21 +1542,25 @@ def render_filters(df):
     if st.session_state.get("filter_actions") is None and unique_labels:
         st.session_state["filter_actions"] = unique_labels
 
-    row2 = st.columns([3, 1, 1, 2, 1])
+    unique_locs = sorted(df["Location"].dropna().unique().tolist()) if "Location" in df.columns else []
+
+    row2 = st.columns([2, 2, 1, 1, 2, 1])
 
     with row2[0]:
-        st.multiselect("Actions", unique_labels, key="filter_actions")
+        st.multiselect("Locations", unique_locs, key="filter_locations")
     with row2[1]:
-        min_raw = st.text_input("Min visits", placeholder="Any", key=f"min_v_{n}")
+        st.multiselect("Actions", unique_labels, key="filter_actions")
     with row2[2]:
-        max_raw = st.text_input("Max visits", placeholder="Any", key=f"max_v_{n}")
+        min_raw = st.text_input("Min visits", placeholder="Any", key=f"min_v_{n}")
     with row2[3]:
+        max_raw = st.text_input("Max visits", placeholder="Any", key=f"max_v_{n}")
+    with row2[4]:
         st.text_input(
             "Search by phone",
             placeholder="Last 4 digits or full number",
             key="filter_search",
         )
-    with row2[4]:
+    with row2[5]:
         st.write("")
         if st.button("✕ Clear", key="cf_btn", use_container_width=True):
             st.session_state.update({
