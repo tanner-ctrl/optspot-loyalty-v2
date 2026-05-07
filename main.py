@@ -362,6 +362,190 @@ def build_top_visitors_chart(labels, visits):
     return fig
 
 
+def render_location_performance(df):
+    if "Location" not in df.columns:
+        return
+
+    n_locs = df["Location"].nunique()
+
+    if n_locs < 2:
+        st.markdown(
+            f"""
+            <div style="background:#f0f7ff;border-left:4px solid {MID_BLUE};
+                        border-radius:4px;padding:14px 20px;color:{PRIMARY_NAVY};font-size:14px;">
+              Only one location detected. Multi-location comparisons appear when
+              your data includes multiple kiosks.
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        return
+
+    # ── Data prep ─────────────────────────────────────────────────────────────
+    loc = df.groupby("Location").agg(
+        visits    = ("Location", "count"),
+        customers = ("Mobile",   "nunique") if "Mobile" in df.columns else ("Location", "count"),
+    ).reset_index()
+
+    loc["avg_visits"] = (loc["visits"] / loc["customers"].replace(0, 1)).round(1)
+
+    # Loyal % — customers at this location with 3+ visits (within filtered df)
+    if "Mobile" in df.columns:
+        visit_counts = df.groupby(["Location", "Mobile"]).size().reset_index(name="_vc")
+        loyal_mask   = visit_counts[visit_counts["_vc"] >= 3].groupby("Location")["Mobile"].nunique()
+        loc["loyal_pct"] = (
+            loc.set_index("Location")["customers"]
+            .map(lambda _: None)  # placeholder — overwritten below
+        )
+        for idx, row in loc.iterrows():
+            l = row["Location"]
+            loyal_n = int(loyal_mask.get(l, 0))
+            loc.at[idx, "loyal_pct"] = (
+                f"{round(loyal_n / row['customers'] * 100)}%" if row["customers"] else "—"
+            )
+    else:
+        loc["loyal_pct"] = "—"
+
+    # Lapsed % — customers at this location with last visit 30+ days ago
+    if "Mobile" in df.columns and "Date" in df.columns:
+        today  = date.today()
+        dt_col = pd.to_datetime(df["Date"], errors="coerce")
+        last   = df.copy()
+        last["_dt"] = dt_col
+        last_visit = last.groupby(["Location", "Mobile"])["_dt"].max().reset_index()
+        last_visit["_days"] = last_visit["_dt"].apply(
+            lambda d: (today - d.date()).days if pd.notna(d) else None
+        )
+        lapsed_by_loc = (
+            last_visit[last_visit["_days"] >= 30]
+            .groupby("Location")["Mobile"].nunique()
+        )
+        for idx, row in loc.iterrows():
+            l        = row["Location"]
+            lapsed_n = int(lapsed_by_loc.get(l, 0))
+            loc.at[idx, "lapsed_pct"] = (
+                f"{round(lapsed_n / row['customers'] * 100)}%" if row["customers"] else "—"
+            )
+    else:
+        loc["lapsed_pct"] = "—"
+
+    # Sort descending for table; ascending for horizontal bar (Plotly reverses y-axis)
+    loc_desc = loc.sort_values("visits", ascending=False).reset_index(drop=True)
+    loc_asc  = loc.sort_values("visits", ascending=True).reset_index(drop=True)
+
+    # ── Insight callout ───────────────────────────────────────────────────────
+    best  = loc_desc.iloc[0]
+    worst = loc_desc.iloc[-1]
+    if worst["avg_visits"] > 0 and best["avg_visits"] >= 2 * worst["avg_visits"]:
+        ratio = round(best["avg_visits"] / worst["avg_visits"], 1)
+        st.markdown(
+            f"""
+            <div style="background:#f0f7ff;border-left:4px solid {MID_BLUE};
+                        border-radius:4px;padding:14px 20px;margin-bottom:12px;
+                        color:{PRIMARY_NAVY};font-size:14px;">
+              <strong>Standout:</strong> {_html.escape(str(best['Location']))} has
+              {best['avg_visits']} avg visits per customer — {ratio}x higher than
+              {_html.escape(str(worst['Location']))} at {worst['avg_visits']}.
+              Look at what they're doing differently and replicate it.
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    # ── Bar chart ─────────────────────────────────────────────────────────────
+    st.subheader("Performance by Location")
+    st.caption(
+        "Visits per kiosk over the selected period. Compare your locations side by side "
+        "to find what's working — and where to invest."
+    )
+
+    height = max(200, n_locs * 40 + 100)
+    fig = go.Figure(go.Bar(
+        x=loc_asc["visits"],
+        y=loc_asc["Location"],
+        orientation="h",
+        marker_color=MID_BLUE,
+        hovertemplate="%{y}: %{x:,} visits<extra></extra>",
+        text=loc_asc["visits"].apply(lambda v: f"{v:,} visits"),
+        textposition="outside",
+        textfont=dict(color="#FFFFFF", size=12),
+        cliponaxis=False,
+    ))
+    fig.update_layout(
+        xaxis_title="Visits",
+        height=height,
+        margin=dict(t=20, b=20, l=20, r=80),
+        plot_bgcolor="rgba(0,0,0,0)",
+        paper_bgcolor="rgba(0,0,0,0)",
+    )
+    st.plotly_chart(fig, width="stretch")
+
+    # ── Health Score ──────────────────────────────────────────────────────────
+    def _health(row):
+        lp  = row["loyal_pct"]
+        lap = row["lapsed_pct"]
+        if lp == "—" or lap == "—":
+            return None
+        try:
+            loyal_n  = int(str(lp).rstrip("%"))
+            lapsed_n = int(str(lap).rstrip("%"))
+            return round((loyal_n + (100 - lapsed_n)) / 2)
+        except (ValueError, TypeError):
+            return None
+
+    loc_desc["health_score"] = loc_desc.apply(_health, axis=1)
+
+    # ── Comparison table ──────────────────────────────────────────────────────
+    table_df = loc_desc[["Location", "visits", "customers", "avg_visits",
+                          "loyal_pct", "lapsed_pct", "health_score"]].rename(columns={
+        "visits":       "Visits",
+        "customers":    "Customers",
+        "avg_visits":   "Avg Visits / Customer",
+        "loyal_pct":    "Loyal %",
+        "lapsed_pct":   "Lapsed %",
+        "health_score": "Health Score",
+    })
+
+    col_cfg = {
+        "Location": st.column_config.TextColumn(
+            "Location",
+            help="The kiosk where these customers checked in.",
+        ),
+        "Visits": st.column_config.NumberColumn(
+            "Visits",
+            help="Total loyalty interactions at this kiosk over the selected period.",
+            format="%d",
+        ),
+        "Customers": st.column_config.NumberColumn(
+            "Customers",
+            help="Number of unique customers who used this kiosk.",
+            format="%d",
+        ),
+        "Avg Visits / Customer": st.column_config.NumberColumn(
+            "Avg Visits / Customer",
+            help="Average number of times each customer at this kiosk has visited. Higher means stickier.",
+            format="%.1f",
+        ),
+        "Loyal %": st.column_config.TextColumn(
+            "Loyal %",
+            help="Share of this kiosk's customers who have visited 3 or more times. Higher means more customers became regulars.",
+        ),
+        "Lapsed %": st.column_config.TextColumn(
+            "Lapsed %",
+            help="Share of this kiosk's customers who haven't visited in 30 or more days. Lower is better.",
+        ),
+        "Health Score": st.column_config.ProgressColumn(
+            "Health Score",
+            help="Combined score from 0 to 100. Average of Loyal % and Active % (100 - Lapsed %). Higher = healthier loyalty program at this kiosk.",
+            format="%d",
+            min_value=0,
+            max_value=100,
+        ),
+    }
+
+    st.dataframe(table_df, column_config=col_cfg, width="stretch", hide_index=True)
+
+
 def render_top_visitors(df):
     st.subheader("Your Most Loyal Customers")
     st.caption(
@@ -1689,6 +1873,11 @@ def page_dashboard():
         st.divider()
         with st.container(border=True):
             render_action_distribution(df_filtered)
+
+    if "Location" in df_filtered.columns:
+        st.divider()
+        with st.container(border=True):
+            render_location_performance(df_filtered)
 
     if "Mobile" in df_filtered.columns:
         st.divider()
