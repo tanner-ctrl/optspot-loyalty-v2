@@ -3,4 +3,4 @@ plotly
 pandas
 faker
 reportlab
-kaleido
+kaleido==0.2.1
