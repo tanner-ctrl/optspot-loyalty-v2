@@ -1,3 +1,4 @@
+import hashlib
 import html as _html
 import io
 import os
@@ -140,6 +141,20 @@ def auto_match(file_cols, schema_field):
     return None
 
 
+def _password_hash(pw):
+    return hashlib.sha256(pw.encode()).hexdigest()
+
+
+def _get_correct_password():
+    correct = "demo-password"
+    try:
+        if "APP_PASSWORD" in st.secrets:
+            correct = st.secrets["APP_PASSWORD"]
+    except Exception:
+        pass
+    return correct
+
+
 def _render_login():
     import base64 as _b64
     _logo_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "optspot_logo.png")
@@ -175,35 +190,42 @@ def _render_login():
         pw = st.text_input("Password", type="password", label_visibility="collapsed",
                            placeholder="Enter password")
         if st.button("Enter", use_container_width=True, type="primary"):
-            correct = "demo-password"
-            try:
-                if "APP_PASSWORD" in st.secrets:
-                    correct = st.secrets["APP_PASSWORD"]
-            except Exception:
-                pass
+            correct = _get_correct_password()
             if pw == correct:
                 st.session_state["authenticated"] = True
+                st.query_params["auth"] = _password_hash(correct)
                 st.rerun()
             else:
                 st.error("Incorrect password.")
 
 
-# Auto-load sample data once per session
+# Auto-load data once per session — imported file takes priority over sample
 if "loaded_data" not in st.session_state:
-    sample_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sample_data.csv")
-    if os.path.exists(sample_path):
-        _df = pd.read_csv(sample_path, index_col=False)
+    _base      = os.path.dirname(os.path.abspath(__file__))
+    _curr_path = os.path.join(_base, "current_data.csv")
+    _samp_path = os.path.join(_base, "sample_data.csv")
+    if os.path.exists(_curr_path):
+        _df = pd.read_csv(_curr_path, index_col=False)
         _df = _df.dropna(axis=1, how="all")
         st.session_state["loaded_data"] = split_datetime_column(_df)
-        st.session_state["auto_loaded"] = True
+        st.session_state["auto_loaded"] = "imported"
+    elif os.path.exists(_samp_path):
+        _df = pd.read_csv(_samp_path, index_col=False)
+        _df = _df.dropna(axis=1, how="all")
+        st.session_state["loaded_data"] = split_datetime_column(_df)
+        st.session_state["auto_loaded"] = "sample"
     else:
         st.session_state["loaded_data"] = None
         st.session_state["auto_loaded"] = False
 
 # ── Auth gate ─────────────────────────────────────────────────────────────────
 if not st.session_state.get("authenticated"):
-    _render_login()
-    st.stop()
+    _token = st.query_params.get("auth", "")
+    if _token and _token == _password_hash(_get_correct_password()):
+        st.session_state["authenticated"] = True
+    else:
+        _render_login()
+        st.stop()
 
 
 def render_status_line():
@@ -224,7 +246,14 @@ page = st.sidebar.radio(
     ["Dashboard", "Retention", "Directory", "Dispatcher", "Import Files"],
 )
 
-if st.session_state.get("auto_loaded"):
+_auto = st.session_state.get("auto_loaded")
+if _auto == "imported":
+    st.sidebar.markdown(
+        "<p style='font-size:12px;color:#aaa;margin-top:4px;'>"
+        "Last imported file loaded automatically. Use Import Files to replace.</p>",
+        unsafe_allow_html=True,
+    )
+elif _auto == "sample":
     st.sidebar.markdown(
         "<p style='font-size:12px;color:#aaa;margin-top:4px;'>"
         "Sample data loaded. Use Import Files to replace.</p>",
@@ -234,6 +263,10 @@ if st.session_state.get("auto_loaded"):
 st.sidebar.markdown("---")
 if st.sidebar.button("Log out"):
     st.session_state["authenticated"] = False
+    try:
+        del st.query_params["auth"]
+    except Exception:
+        pass
     st.rerun()
 
 
@@ -1120,6 +1153,163 @@ def compute_tldr(df):
     return bullets
 
 
+def detect_data_quality(df):
+    issues = []
+
+    # 1. Concentration spike (needs Time)
+    if "Time" in df.columns:
+        times    = pd.to_datetime("2000-01-01 " + df["Time"].astype(str), errors="coerce")
+        bin_mins = ((times.dt.hour * 60 + times.dt.minute) // 30) * 30
+        counts   = bin_mins.value_counts()
+        total    = counts.sum()
+        if total > 0:
+            peak_bin   = int(counts.idxmax())
+            peak_count = int(counts.max())
+            peak_pct   = peak_count / total * 100
+            if peak_pct > 40:
+                issues.append({
+                    "severity": "warning",
+                    "title":    "Possible kiosk batching detected.",
+                    "body": (
+                        f"Possible kiosk batching: {peak_pct:.0f}% of all visits land in a single "
+                        f"30-minute window ({bin_to_range_label(peak_bin)}). This usually means your "
+                        "kiosk is timestamping events at the top of the hour, not at actual visit time. "
+                        "Check with your kiosk vendor. The Popular Times chart may not reflect real "
+                        "customer behavior."
+                    ),
+                })
+
+    # Date-dependent rules
+    if "Date" in df.columns:
+        dates    = pd.to_datetime(df["Date"], errors="coerce").dropna()
+        if len(dates):
+            min_date  = dates.min()
+            max_date  = dates.max()
+            span_days = (max_date - min_date).days
+
+            # 2. Acquisition growth curve
+            sorted_dates = sorted(dates.dt.date.unique())
+            n = len(sorted_dates)
+            if n >= 6:
+                third = max(1, n // 3)
+                first_dates = set(sorted_dates[:third])
+                last_dates  = set(sorted_dates[-third:])
+                daily = df.copy()
+                daily["_date"] = pd.to_datetime(df["Date"], errors="coerce").dt.date
+                daily_counts = daily.groupby("_date").size()
+                first_avg = daily_counts[daily_counts.index.isin(first_dates)].mean()
+                last_avg  = daily_counts[daily_counts.index.isin(last_dates)].mean()
+                if last_avg > 2 * first_avg and first_avg > 0:
+                    issues.append({
+                        "severity": "info",
+                        "title":    "Visits are growing over time.",
+                        "body": (
+                            f"Visits are growing over time ({first_avg:.1f} → {last_avg:.1f} avg per day). "
+                            "This is acquisition growth, not weekly variation. Be careful interpreting "
+                            "single-day 'outliers' — they're often just the natural growth curve."
+                        ),
+                    })
+
+            # 3. Short date range
+            if span_days < 60:
+                issues.append({
+                    "severity": "info",
+                    "title":    f"Limited date range: only {span_days} days of data available.",
+                    "body": (
+                        f"Limited date range: only {span_days} days of data available. Cohort retention "
+                        "analysis needs at least 90 days to show meaningful month-over-month trends."
+                    ),
+                })
+
+            # 4. Stale data
+            days_old = (date.today() - max_date.date()).days
+            if days_old > 7:
+                issues.append({
+                    "severity": "warning",
+                    "title":    f"Most recent data is from {max_date.strftime('%b %-d, %Y')} ({days_old} days old).",
+                    "body": (
+                        f"Most recent data is from {max_date.strftime('%b %-d, %Y')} ({days_old} days old). "
+                        "This dashboard may not reflect current customer behavior. Verify your export is "
+                        "up-to-date."
+                    ),
+                })
+
+            # 5. Sparse cohorts (needs Mobile + Date)
+            if "Mobile" in df.columns:
+                try:
+                    pct_pivot, _, cohort_sizes = compute_cohort_retention(df)
+                    if len(cohort_sizes) >= 2:
+                        sparse_n   = int((cohort_sizes < 5).sum())
+                        sparse_pct = round(sparse_n / len(cohort_sizes) * 100)
+                        if sparse_pct >= 50:
+                            issues.append({
+                                "severity": "info",
+                                "title":    f"{sparse_pct}% of your cohorts have fewer than 5 joiners.",
+                                "body": (
+                                    f"{sparse_pct}% of your cohorts have fewer than 5 joiners. Small cohorts "
+                                    "produce noisy retention numbers — one customer = a big swing in percentage. "
+                                    "Look at larger cohorts for the most reliable trends."
+                                ),
+                            })
+                except Exception:
+                    pass
+
+    # 6. Thin location data (needs Location)
+    if "Location" in df.columns and df["Location"].nunique() >= 2:
+        loc_counts = df.groupby("Location").size()
+        thin_n     = int((loc_counts < 50).sum())
+        if thin_n > 0:
+            issues.append({
+                "severity": "info",
+                "title":    f"{thin_n} of your locations have fewer than 50 visits.",
+                "body": (
+                    f"{thin_n} of your locations have fewer than 50 visits. Their per-location "
+                    "metrics (Loyal %, Health Score) will be noisy. Compare with caution."
+                ),
+            })
+
+    # 7. All healthy
+    if not issues:
+        issues.append({
+            "severity": "info",
+            "title":    "Data quality looks good.",
+            "body":     "No batching, growth-curve, or freshness issues detected.",
+        })
+
+    return issues
+
+
+def render_data_quality(df):
+    issues   = detect_data_quality(df)
+    n_issues = len(issues)
+    is_clean = n_issues == 1 and issues[0]["title"] == "Data quality looks good."
+    has_warn = any(i["severity"] == "warning" for i in issues)
+
+    icon  = "✓" if is_clean else ("⚠️" if has_warn else "ℹ️")
+    count = "" if is_clean else f" ({n_issues} items)"
+    label = f"{icon} Data Quality Notes{count}"
+
+    WARN_STYLE = (
+        "background:#fffbe6;border-left:4px solid #d4a00a;"
+        "border-radius:4px;padding:12px 16px;margin-bottom:8px;color:#7a5500;"
+    )
+    INFO_STYLE = (
+        f"background:#f0f7ff;border-left:4px solid {MID_BLUE};"
+        f"border-radius:4px;padding:12px 16px;margin-bottom:8px;color:{PRIMARY_NAVY};"
+    )
+
+    with st.expander(label, expanded=False):
+        for issue in issues:
+            style = WARN_STYLE if issue["severity"] == "warning" else INFO_STYLE
+            st.markdown(
+                f'<div style="{style}">'
+                f'<strong>{_html.escape(issue["title"])}</strong><br>'
+                f'<span style="font-size:13px;">{_html.escape(issue["body"])}</span>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
+
 def render_tldr(df):
     bullets = compute_tldr(df)
     if not bullets:
@@ -1780,6 +1970,7 @@ def page_dashboard():
     st.caption(build_filter_summary(df, df_filtered))
 
     render_report_expander(df_filtered)
+    render_data_quality(df_filtered)
 
     st.divider()
     render_tldr(df_filtered)
@@ -2242,9 +2433,15 @@ def page_import():
 
         existing = st.session_state.get("loaded_data")
         if mode == "Append to existing data" and existing is not None:
-            st.session_state["loaded_data"] = pd.concat([existing, mapped_df], ignore_index=True)
+            final_df = pd.concat([existing, mapped_df], ignore_index=True)
         else:
-            st.session_state["loaded_data"] = mapped_df
+            final_df = mapped_df
+
+        st.session_state["loaded_data"] = final_df
+        final_df.to_csv(
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "current_data.csv"),
+            index=False,
+        )
 
         n_files = len(dfs)
         st.session_state["auto_loaded"]        = False
@@ -2253,6 +2450,17 @@ def page_import():
             f"{n_files} file{'s' if n_files > 1 else ''}."
         )
         st.session_state["import_source_files"] = ", ".join(name for name, _ in dfs)
+        st.rerun()
+
+    # ── Clear loaded data ─────────────────────────────────────────────────────
+    st.markdown("---")
+    st.caption("Danger zone")
+    if st.button("Clear loaded data", type="secondary"):
+        _curr = os.path.join(os.path.dirname(os.path.abspath(__file__)), "current_data.csv")
+        if os.path.exists(_curr):
+            os.remove(_curr)
+        st.session_state.pop("loaded_data", None)
+        st.session_state.pop("auto_loaded", None)
         st.rerun()
 
 
