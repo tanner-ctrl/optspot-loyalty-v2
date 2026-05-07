@@ -45,15 +45,16 @@ LIGHT_BLUE    = "#5EAFE7"
 LIGHTEST_BLUE = "#A4D6F0"
 
 FILTER_DEFAULTS = {
-    "filter_preset":      "All time",
-    "filter_date_start":  None,
-    "filter_date_end":    None,
-    "filter_actions":     None,
-    "filter_locations":   [],
-    "filter_min_visits":  None,
-    "filter_max_visits":  None,
-    "filter_search":      "",
-    "filter_reset_count": 0,
+    "filter_preset":        "All time",
+    "filter_date_start":    None,
+    "filter_date_end":      None,
+    "filter_actions":       None,
+    "filter_locations":     [],
+    "filter_min_visits":    None,
+    "filter_max_visits":    None,
+    "filter_search":        "",
+    "filter_reset_count":   0,
+    "filter_compare_prior": False,
 }
 
 
@@ -1346,7 +1347,7 @@ def render_tldr(df):
     )
 
 
-def compute_kpis(df):
+def compute_kpis(df, prior_df=None):
     total_visits     = len(df)
     unique_customers = df["Mobile"].nunique() if "Mobile" in df.columns else 0
     avg_visits       = round(total_visits / unique_customers, 1) if unique_customers else 0
@@ -1358,11 +1359,31 @@ def compute_kpis(df):
         peak_count   = int(peak_series.max())
         peak_display = f"{peak_date.strftime('%b')} {peak_date.day} — {peak_count:,} visits"
 
+    def _delta(current, prior):
+        if prior is None or prior == 0:
+            return None
+        return round((current - prior) / prior * 100, 1)
+
+    delta_visits = delta_customers = delta_avg = None
+    if prior_df is not None and not prior_df.empty:
+        p_visits    = len(prior_df)
+        p_customers = prior_df["Mobile"].nunique() if "Mobile" in prior_df.columns else 0
+        p_avg       = round(p_visits / p_customers, 1) if p_customers else 0
+        delta_visits    = _delta(total_visits,     p_visits)
+        delta_customers = _delta(unique_customers, p_customers)
+        delta_avg       = _delta(avg_visits,       p_avg)
+    elif prior_df is not None and prior_df.empty:
+        # Prior period exists but has no rows — signal with sentinel
+        delta_visits = delta_customers = delta_avg = "no_data"
+
     return {
         "total_visits":     total_visits,
         "unique_customers": unique_customers,
         "avg_visits":       avg_visits,
         "peak_display":     peak_display,
+        "delta_visits":     delta_visits,
+        "delta_customers":  delta_customers,
+        "delta_avg":        delta_avg,
     }
 
 
@@ -1414,6 +1435,73 @@ def get_filtered_data():
             result = result[mob.str.contains(s, case=False, na=False)]
 
     return result
+
+
+def get_prior_period_data():
+    """Return dict {df, start, end, truncated} for the prior period, or None."""
+    if not st.session_state.get("filter_compare_prior"):
+        return None
+
+    preset = st.session_state.get("filter_preset", "All time")
+    if preset == "All time":
+        return None
+
+    current_start = st.session_state.get("filter_date_start")
+    current_end   = st.session_state.get("filter_date_end")
+    if current_start is None or current_end is None:
+        return None
+
+    df = st.session_state.get("loaded_data")
+    if df is None or df.empty:
+        return None
+
+    period_len  = (current_end - current_start).days
+    prior_end   = current_start - timedelta(days=1)
+    prior_start = prior_end - timedelta(days=period_len)
+
+    # Detect truncation
+    truncated = False
+    if "Date" in df.columns:
+        earliest = pd.to_datetime(df["Date"], errors="coerce").dropna().min().date()
+        if prior_start < earliest:
+            prior_start = earliest
+            truncated   = True
+
+    result = df.copy()
+    if "Date" in result.columns:
+        dates  = pd.to_datetime(result["Date"], errors="coerce")
+        result = result[(dates >= pd.Timestamp(prior_start)) & (dates <= pd.Timestamp(prior_end))]
+
+    # Apply same action / location / visit-count / search filters
+    labels = st.session_state.get("filter_actions")
+    if labels is not None and "Action" in result.columns:
+        all_lbls = {parse_action_label(a) for a in df["Action"].dropna().unique()}
+        if set(labels) != all_lbls:
+            result = result[result["Action"].apply(parse_action_label).isin(labels)]
+
+    locs = st.session_state.get("filter_locations", [])
+    if locs and "Location" in result.columns:
+        result = result[result["Location"].isin(locs)]
+
+    min_v  = st.session_state.get("filter_min_visits")
+    max_v  = st.session_state.get("filter_max_visits")
+    if (min_v or max_v) and "Mobile" in df.columns:
+        totals = df.groupby("Mobile").size()
+        mask   = pd.Series(True, index=totals.index)
+        if min_v: mask &= totals >= min_v
+        if max_v: mask &= totals <= max_v
+        result = result[result["Mobile"].isin(totals[mask].index)]
+
+    search = st.session_state.get("filter_search", "")
+    if search.strip() and "Mobile" in result.columns:
+        s   = search.strip()
+        mob = result["Mobile"].astype(str)
+        if len(s) <= 4 and s.isdigit():
+            result = result[mob.str.endswith(s)]
+        else:
+            result = result[mob.str.contains(s, case=False, na=False)]
+
+    return {"df": result, "start": prior_start, "end": prior_end, "truncated": truncated}
 
 
 def build_filter_summary(df_full, df_filtered):
@@ -1474,7 +1562,7 @@ def render_filters(df):
 
     st.markdown("**Filter data**")
 
-    row1           = st.columns([1, 1, 1, 1, 0.2, 1.5, 1.5])
+    row1           = st.columns([1, 1, 1, 1, 0.2, 1.5, 1.5, 2])
     presets        = ["Last 7 days", "Last 30 days", "Last 90 days", "All time"]
     current_preset = st.session_state.get("filter_preset", "All time")
 
@@ -1520,6 +1608,11 @@ def render_filters(df):
             max_value=data_max,
             key=f"de_{n}",
         )
+    with row1[7]:
+        st.write("")
+        st.toggle("Compare vs previous period", key="filter_compare_prior")
+        if st.session_state.get("filter_compare_prior") and current_preset == "All time":
+            st.caption("Pick a date range to enable comparison.")
 
     if current_preset == "All time":
         if r_start != data_min or r_end != data_max:
@@ -2001,22 +2094,33 @@ def page_dashboard():
     render_tldr(df_filtered)
 
     st.divider()
-    kpis = compute_kpis(df_filtered)
-    c1, c2, c3, c4 = st.columns(4)
+    prior_result = get_prior_period_data()
+    prior_df     = prior_result["df"] if prior_result else None
+    kpis         = compute_kpis(df_filtered, prior_df)
 
+    def _fmt_delta(key):
+        v = kpis.get(key)
+        if v == "no_data" or v is None:
+            return None
+        return f"{v:+.1f}% vs prior"
+
+    c1, c2, c3, c4 = st.columns(4)
     c1.metric(
         "TOTAL VISITS",
         f"{kpis['total_visits']:,}",
+        delta=_fmt_delta("delta_visits"),
         help="Every customer interaction logged at the kiosk in this period.",
     )
     c2.metric(
         "UNIQUE CUSTOMERS",
         f"{kpis['unique_customers']:,}",
+        delta=_fmt_delta("delta_customers"),
         help="Number of different people who used your loyalty program in this period.",
     )
     c3.metric(
         "AVG VISITS PER CUSTOMER",
         str(kpis["avg_visits"]),
+        delta=_fmt_delta("delta_avg"),
         help=(
             "On average, how many times each customer came back. "
             "Higher is better — it means your loyalty program is bringing people back."
@@ -2035,7 +2139,32 @@ def page_dashboard():
         dates    = pd.to_datetime(df_filtered["Date"], errors="coerce").dropna()
         min_date = dates.min().strftime("%b %-d, %Y")
         max_date = dates.max().strftime("%b %-d, %Y")
-        st.caption(f"Data range: {min_date} to {max_date}")
+
+        if prior_result:
+            ps = prior_result["start"].strftime("%b %-d, %Y")
+            pe = prior_result["end"].strftime("%b %-d, %Y")
+            cs = st.session_state.get("filter_date_start")
+            ce = st.session_state.get("filter_date_end")
+            period_days = ((ce - cs).days + 1) if cs and ce else "?"
+            if kpis.get("delta_visits") == "no_data":
+                st.caption(
+                    f"Comparing {min_date} – {max_date} vs {ps} – {pe}. "
+                    "No records in the prior period — deltas unavailable."
+                )
+            elif prior_result["truncated"]:
+                prior_days = (prior_result["end"] - prior_result["start"]).days + 1
+                st.caption(
+                    f"Comparing {min_date} – {max_date} vs {ps} – {pe} "
+                    f"(prior period is shorter — only {prior_days} days of history available "
+                    "before current period)."
+                )
+            else:
+                st.caption(
+                    f"Comparing {min_date} – {max_date} vs {ps} – {pe} "
+                    f"({period_days} days each)."
+                )
+        else:
+            st.caption(f"Data range: {min_date} to {max_date}")
 
     if "Date" not in df_filtered.columns:
         return
