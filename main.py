@@ -38,6 +38,11 @@ COLUMN_ALIASES = {
     "License Plate": ["license plate", "data3"],
 }
 
+PRIMARY_NAVY  = "#1E3A6B"
+MID_BLUE      = "#2D9BD3"
+LIGHT_BLUE    = "#5EAFE7"
+LIGHTEST_BLUE = "#A4D6F0"
+
 FILTER_DEFAULTS = {
     "filter_preset":      "All time",
     "filter_date_start":  None,
@@ -101,7 +106,7 @@ def render_action_distribution(df):
             <span style="color:#888;font-size:14px;">{count:,} ({pct:.1f}%)</span>
           </div>
           <div style="background:#e0e7ef;border-radius:4px;height:12px;">
-            <div style="background:#1a4f7a;width:{bar_width:.1f}%;height:12px;border-radius:4px;"></div>
+            <div style="background:{MID_BLUE};width:{bar_width:.1f}%;height:12px;border-radius:4px;"></div>
           </div>
         </div>""")
 
@@ -136,22 +141,30 @@ def auto_match(file_cols, schema_field):
 
 
 def _render_login():
-    st.markdown("""
+    import base64 as _b64
+    _logo_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "optspot_logo.png")
+    _logo_b64  = _b64.b64encode(open(_logo_path, "rb").read()).decode() if os.path.exists(_logo_path) else ""
+    _img_tag   = (
+        f'<img src="data:image/png;base64,{_logo_b64}" '
+        'width="200" style="margin-bottom:12px;display:block;margin-left:auto;margin-right:auto;">'
+        if _logo_b64 else
+        '<p style="color:#5EAFE7;font-size:20px;font-weight:700;margin:0 0 8px 0;">OptSpot</p>'
+    )
+    st.markdown(f"""
     <style>
-    .login-wrap {
+    .login-wrap {{
         display: flex; justify-content: center; margin-top: 80px;
-    }
-    .login-card {
+    }}
+    .login-card {{
         background: #0d2b4e; border-radius: 12px; padding: 40px 48px;
         width: 360px; box-shadow: 0 4px 24px rgba(0,0,0,0.25);
         text-align: center;
-    }
-    .login-card h2 { color: #5bc4f5; margin: 0 0 4px 0; font-size: 22px; font-weight: 700; }
-    .login-card p  { color: #a8c8e8; margin: 0 0 28px 0; font-size: 14px; }
+    }}
+    .login-card p  {{ color: #A4D6F0; margin: 8px 0 28px 0; font-size: 14px; }}
     </style>
     <div class="login-wrap">
       <div class="login-card">
-        <h2>OptSpot Loyalty</h2>
+        {_img_tag}
         <p>Analytics Dashboard</p>
       </div>
     </div>
@@ -203,7 +216,8 @@ def render_status_line():
 
 # ── Sidebar ──────────────────────────────────────────────────────────────────
 
-st.sidebar.title("OptSpot Loyalty")
+st.sidebar.image("optspot_logo.png", width=180)
+st.sidebar.caption("OPTSPOT LOYALTY ANALYTICS")
 
 page = st.sidebar.radio(
     "Navigation",
@@ -211,7 +225,11 @@ page = st.sidebar.radio(
 )
 
 if st.session_state.get("auto_loaded"):
-    st.sidebar.caption("Sample data loaded automatically. Use Import Files to replace.")
+    st.sidebar.markdown(
+        "<p style='font-size:12px;color:#aaa;margin-top:4px;'>"
+        "Sample data loaded. Use Import Files to replace.</p>",
+        unsafe_allow_html=True,
+    )
 
 st.sidebar.markdown("---")
 if st.sidebar.button("Log out"):
@@ -247,7 +265,7 @@ def build_activity_chart(labels, counts, log_scale):
     fig = go.Figure(go.Bar(
         x=labels,
         y=counts.values,
-        marker_color="#3d85c8",
+        marker_color=MID_BLUE,
         hovertemplate="%{x}: %{y:,} visits<extra></extra>",
     ))
     fig.update_layout(
@@ -285,11 +303,11 @@ def build_frequency_chart(df):
         customdata.append(n_custs)
 
         if t <= 2:
-            colors.append("#a8c8e8")
+            colors.append(LIGHTEST_BLUE)
         elif t <= 9:
-            colors.append("#3d85c8")
+            colors.append(MID_BLUE)
         else:
-            colors.append("#1a4f7a")
+            colors.append(PRIMARY_NAVY)
 
     fig = go.Figure(go.Bar(
         x=list(tier_range),
@@ -329,7 +347,7 @@ def build_top_visitors_chart(labels, visits):
         x=visits,
         y=labels,
         orientation="h",
-        marker_color="#3d85c8",
+        marker_color=MID_BLUE,
         text=[f"{v:,} visits" for v in visits],
         textposition="outside",
         hovertemplate="%{y} — %{x:,} visits<extra></extra>",
@@ -369,7 +387,8 @@ def render_top_visitors(df):
     labels = [mask_phone(m, reveal) for m in top20["Mobile"]]
     visits = top20["visits"].tolist()
 
-    st.plotly_chart(build_top_visitors_chart(labels, visits), use_container_width=True)
+    with st.container(border=True):
+        st.plotly_chart(build_top_visitors_chart(labels, visits), width="stretch")
 
 
 def bin_to_range_label(bin_mins):
@@ -430,8 +449,8 @@ def build_popular_times_chart(counts):
         y=counts.values,
         mode="lines",
         fill="tozeroy",
-        fillcolor="rgba(61, 133, 200, 0.15)",
-        line=dict(color="#3d85c8", width=2, shape="spline"),
+        fillcolor="rgba(45,155,211,0.15)",
+        line=dict(color=MID_BLUE, width=2, shape="spline"),
         customdata=[bin_to_range_label(b) for b in all_bins],
         hovertemplate="%{customdata}: %{y:,} visits<extra></extra>",
     ))
@@ -446,7 +465,7 @@ def build_popular_times_chart(counts):
             x=peak_bin, y=peak_count,
             text=f"Busiest: {bin_to_range_label(peak_bin)}, {peak_count:,} visits",
             showarrow=True, arrowhead=2, ax=50, ay=-40,
-            bgcolor="white", bordercolor="#3d85c8", borderwidth=1,
+            bgcolor="white", bordercolor=MID_BLUE, borderwidth=1,
             font=dict(size=11),
         )],
     )
@@ -464,11 +483,11 @@ def render_popular_times(df):
     bin_mins = ((times.dt.hour * 60 + times.dt.minute) // 30) * 30
     counts   = bin_mins.value_counts().sort_index()
 
-    st.plotly_chart(build_popular_times_chart(counts), use_container_width=True)
-
-    insight = popular_times_insight(counts)
-    if insight:
-        st.caption(f"**Insight:** {insight}")
+    with st.container(border=True):
+        st.plotly_chart(build_popular_times_chart(counts), width="stretch")
+        insight = popular_times_insight(counts)
+        if insight:
+            st.caption(f"**Insight:** {insight}")
 
 
 def compute_cohort_retention(df):
@@ -575,8 +594,8 @@ def build_cohort_heatmap(pct_pivot, count_pivot, cohort_sizes, mode):
         colorscale = [
             [0.000, "#e8eaed"],
             [0.010, "#eaf2fb"],
-            [0.505, "#3d85c8"],
-            [1.000, "#1a4f7a"],
+            [0.505, MID_BLUE],
+            [1.000, PRIMARY_NAVY],
         ]
         zmin, zmax = -1, 100
     else:
@@ -630,10 +649,11 @@ def render_cohort_heatmap(df):
         key="cohort_mode",
     )
 
-    st.plotly_chart(
-        build_cohort_heatmap(pct_pivot, count_pivot, cohort_sizes, mode),
-        use_container_width=True,
-    )
+    with st.container(border=True):
+        st.plotly_chart(
+            build_cohort_heatmap(pct_pivot, count_pivot, cohort_sizes, mode),
+            width="stretch",
+        )
 
     render_cohort_panels(pct_pivot, cohort_sizes)
 
@@ -686,7 +706,7 @@ def render_cohort_panels(pct_pivot, cohort_sizes):
         )
 
     CARD = (
-        "background:#f0f7ff;border-left:4px solid #3d85c8;border-radius:4px;"
+        f"background:#f0f7ff;border-left:4px solid {MID_BLUE};border-radius:4px;"
         "padding:16px 20px;color:#0a2540;"
     )
     ROW  = "display:flex;justify-content:space-between;font-size:12px;padding:4px 0;"
@@ -763,19 +783,19 @@ def render_cohort_panels(pct_pivot, cohort_sizes):
       </p>
 
       <p style="font-size:11px;font-weight:700;letter-spacing:0.04em;
-                margin:0 0 3px 0;color:#1a4f7a;">ACQUISITION QUALITY</p>
+                margin:0 0 3px 0;color:{PRIMARY_NAVY};">ACQUISITION QUALITY</p>
       <p style="font-size:12px;margin:0 0 12px 0;">{acq_txt}</p>
 
       <div style="{SEP}"></div>
 
       <p style="font-size:11px;font-weight:700;letter-spacing:0.04em;
-                margin:6px 0 3px 0;color:#1a4f7a;">THE CLIFF</p>
+                margin:6px 0 3px 0;color:{PRIMARY_NAVY};">THE CLIFF</p>
       <p style="font-size:12px;margin:0 0 12px 0;">{cliff_body}</p>
 
       <div style="{SEP}"></div>
 
       <p style="font-size:11px;font-weight:700;letter-spacing:0.04em;
-                margin:6px 0 3px 0;color:#1a4f7a;">SEASONAL DRIFT</p>
+                margin:6px 0 3px 0;color:{PRIMARY_NAVY};">SEASONAL DRIFT</p>
       <p style="font-size:12px;margin:0;">{_html.escape(seasonal_txt)}</p>
     </div>
     """
@@ -923,15 +943,15 @@ def render_tldr(df):
 
     items = "".join(
         f'<li style="margin-bottom:8px;padding-left:18px;position:relative;">'
-        f'<span style="position:absolute;left:0;color:#3d85c8;font-weight:bold;">→</span>'
+        f'<span style="position:absolute;left:0;color:{MID_BLUE};font-weight:bold;">→</span>'
         f"{_html.escape(b)}</li>"
         for b in bullets
     )
     st.markdown(
         f"""
-        <div style="background:#f0f7ff;border-left:4px solid #3d85c8;
+        <div style="background:#f0f7ff;border-left:4px solid {MID_BLUE};
                     border-radius:4px;padding:16px 20px;margin-bottom:20px;color:#0a2540;">
-          <p style="font-weight:700;font-size:15px;margin:0 0 10px 0;color:#061a2d;">
+          <p style="font-weight:700;font-size:15px;margin:0 0 10px 0;color:{PRIMARY_NAVY};">
             What This Data Tells You
           </p>
           <ul style="list-style:none;padding:0;margin:0;line-height:1.65;">
@@ -1285,11 +1305,12 @@ def generate_pdf(df, wash_name, prepared_for):
             "reportlab is not installed. Run: pip install reportlab kaleido"
         )
 
-    NAVY   = HexColor("#0a2540")
+    NAVY   = HexColor(PRIMARY_NAVY)
     GREY   = HexColor("#333333")
     LTGREY = HexColor("#888888")
     BGBLUE = HexColor("#f0f2f6")
     RULE   = HexColor("#cccccc")
+    ARROW  = HexColor(MID_BLUE)
 
     W = 540  # content width in points (7.5" with 0.5" margins each side)
 
@@ -1349,6 +1370,14 @@ def generate_pdf(df, wash_name, prepared_for):
     # ── PAGE 1 — Cover / Executive Summary ───────────────────────────────────
     story = []
 
+    logo_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "optspot_logo_dark.png")
+    if os.path.exists(logo_path):
+        logo_img = Image(logo_path, width=200, height=50)
+        logo_tbl = Table([[logo_img]], colWidths=[W])
+        logo_tbl.setStyle(TableStyle([("ALIGN", (0, 0), (-1, -1), "CENTER")]))
+        story.append(logo_tbl)
+        story.append(Spacer(1, 20))
+
     story.append(Paragraph("OPTSPOT LOYALTY ANALYTICS", sty_report_label))
     story.append(Spacer(1, 14))
     story.append(Paragraph("Loyalty Performance Report", sty_title))
@@ -1366,7 +1395,7 @@ def generate_pdf(df, wash_name, prepared_for):
     for b in bullets:
         story.append(
             Paragraph(
-                f'→  {_html.escape(b)}',
+                f'<font color="{MID_BLUE}">→</font>  {_html.escape(b)}',
                 sty_bullet,
             )
         )
@@ -1530,6 +1559,8 @@ def render_report_expander(df):
 
 def page_dashboard():
     st.header("Dashboard")
+    st.caption("Track customer visits, loyalty trends, and engagement at a glance.")
+    st.divider()
     render_status_line()
 
     df = st.session_state.get("loaded_data")
@@ -1543,6 +1574,7 @@ def page_dashboard():
         <style>
         [data-testid="metric-container"] {
             background-color: #f0f2f6;
+            border: 1px solid rgba(0,0,0,0.08);
             border-radius: 10px;
             padding: 20px 16px;
         }
@@ -1565,8 +1597,10 @@ def page_dashboard():
 
     render_report_expander(df_filtered)
 
+    st.divider()
     render_tldr(df_filtered)
 
+    st.divider()
     kpis = compute_kpis(df_filtered)
     c1, c2, c3, c4 = st.columns(4)
 
@@ -1606,6 +1640,7 @@ def page_dashboard():
     if "Date" not in df_filtered.columns:
         return
 
+    st.divider()
     ctrl_left, ctrl_right = st.columns([3, 1])
     with ctrl_left:
         period = st.radio(
@@ -1632,28 +1667,35 @@ def page_dashboard():
                 "of the next busiest period. Try Log scale to see the rest of the trend."
             )
 
-    st.plotly_chart(build_activity_chart(labels, counts, log_scale), use_container_width=True)
+    with st.container(border=True):
+        st.plotly_chart(build_activity_chart(labels, counts, log_scale), width="stretch")
 
     if "Mobile" in df_filtered.columns:
-        st.subheader("How Often Do Customers Come Back?")
-        st.caption(
-            "Distribution of customer visit counts. Most loyalty programs see a heavy "
-            "left skew — that's normal. The goal is to grow the middle and right."
-        )
-        st.plotly_chart(build_frequency_chart(df_filtered), use_container_width=True)
-        st.markdown(
-            "**Light blue: One-and-Done customers (1–2 visits)** — your biggest growth opportunity.  \n"
-            "**Medium blue: Regulars (3–9 visits)** — your loyal core.  \n"
-            "**Dark blue: VIPs (10+ visits)** — your champions. Send them rewards."
-        )
+        st.divider()
+        with st.container(border=True):
+            st.subheader("How Often Do Customers Come Back?")
+            st.caption(
+                "Distribution of customer visit counts. Most loyalty programs see a heavy "
+                "left skew — that's normal. The goal is to grow the middle and right."
+            )
+            st.plotly_chart(build_frequency_chart(df_filtered), width="stretch")
+            st.markdown(
+                "**Light blue: One-and-Done customers (1–2 visits)** — your biggest growth opportunity.  \n"
+                "**Medium blue: Regulars (3–9 visits)** — your loyal core.  \n"
+                "**Dark blue: VIPs (10+ visits)** — your champions. Send them rewards."
+            )
 
     if "Action" in df_filtered.columns:
-        render_action_distribution(df_filtered)
+        st.divider()
+        with st.container(border=True):
+            render_action_distribution(df_filtered)
 
     if "Mobile" in df_filtered.columns:
+        st.divider()
         render_top_visitors(df_filtered)
 
     if "Time" in df_filtered.columns:
+        st.divider()
         render_popular_times(df_filtered)
     else:
         st.caption(
@@ -1661,6 +1703,7 @@ def page_dashboard():
         )
 
     if "Mobile" in df_filtered.columns and "Date" in df_filtered.columns:
+        st.divider()
         render_cohort_heatmap(df_filtered)
 
 
@@ -1732,6 +1775,7 @@ def render_retention_threshold():
 def page_retention():
     st.header("Retention")
     st.caption("Find customers who are slipping away. Win them back before they're gone.")
+    st.divider()
     render_status_line()
 
     df_full = st.session_state.get("loaded_data")
@@ -1772,9 +1816,9 @@ def page_retention():
 
     st.markdown(
         f"""
-        <div style="background:#f0f7ff;border-left:4px solid #3d85c8;
+        <div style="background:#f0f7ff;border-left:4px solid {MID_BLUE};
                     border-radius:4px;padding:16px 20px;margin-bottom:20px;color:#0a2540;">
-          <span style="font-size:15px;">
+          <span style="font-size:15px;color:{PRIMARY_NAVY};">
             <strong>{n_lapsed:,} customers</strong> haven't been back in {threshold} days.
             That's <strong>{pct}%</strong> of your active customer base.
             Reaching out today is high-leverage.{_html.escape(filter_note)}
@@ -1820,7 +1864,7 @@ def page_retention():
     if has_points:
         col_cfg["Total Points"] = st.column_config.NumberColumn("Total Points", format="%d")
 
-    st.dataframe(disp_df, column_config=col_cfg, use_container_width=True, hide_index=True)
+    st.dataframe(disp_df, column_config=col_cfg, width="stretch", hide_index=True)
 
     if not show_all and len(lapsed_df) > 100:
         st.caption(f"Showing 100 of {n_lapsed:,} lapsed customers.")
@@ -1849,18 +1893,24 @@ def page_retention():
 
 def page_directory():
     st.header("Directory")
+    st.caption("Look up an individual customer.")
+    st.divider()
     render_status_line()
     st.info("Coming soon.")
 
 
 def page_dispatcher():
     st.header("Dispatcher")
+    st.caption("Send targeted campaigns to customer segments.")
+    st.divider()
     render_status_line()
     st.info("Coming soon.")
 
 
 def page_import():
     st.header("Import Files")
+    st.caption("Upload your loyalty export CSV to get started.")
+    st.divider()
     render_status_line()
 
     if "import_success_msg" in st.session_state:
@@ -1957,7 +2007,7 @@ def page_import():
         f"Preview from **{first_name}** "
         f"(rows from all files will be processed the same way)."
     )
-    st.dataframe(first_df.head(5), use_container_width=True)
+    st.dataframe(first_df.head(5), width="stretch")
 
     st.write("Map columns to the OptSpot schema. Auto-matched where column names align.")
 
