@@ -1,9 +1,11 @@
+import csv
 import hashlib
 import html as _html
 import io
 import os
 import re
-from datetime import date, timedelta
+import shutil
+from datetime import date, datetime, timedelta
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -43,6 +45,17 @@ PRIMARY_NAVY  = "#1E3A6B"
 MID_BLUE      = "#2D9BD3"
 LIGHT_BLUE    = "#5EAFE7"
 LIGHTEST_BLUE = "#A4D6F0"
+
+_APP_DIR          = os.path.dirname(os.path.abspath(__file__))
+DISPATCH_LOG_PATH = os.path.join(_APP_DIR, "dispatch_log.csv")
+DISPATCH_PDF_DIR  = os.path.join(_APP_DIR, "dispatch_pdfs")
+DISPATCH_LOG_COLS = [
+    "timestamp", "sender_name", "sender_email",
+    "recipient_names", "recipient_emails",
+    "locations", "kiosk_count", "record_count", "wash_name",
+]
+
+_EMAIL_RE = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
 
 FILTER_DEFAULTS = {
     "filter_preset":        "All time",
@@ -294,15 +307,37 @@ def aggregate_visits(df, period):
     return labels, counts
 
 
-def build_activity_chart(labels, counts, log_scale):
-    tick_angle = 0 if len(labels) <= 30 else -35
+def build_activity_chart(labels, counts, log_scale, prior_labels=None, prior_counts=None):
+    tick_angle  = 0 if len(labels) <= 30 else -35
+    show_prior  = prior_labels is not None and prior_counts is not None and len(prior_counts) > 0
 
     fig = go.Figure(go.Bar(
         x=labels,
         y=counts.values,
         marker_color=MID_BLUE,
+        name="Current period",
         hovertemplate="%{x}: %{y:,} visits<extra></extra>",
+        showlegend=show_prior,
     ))
+
+    if show_prior:
+        # Map prior values onto current x-axis positions by index
+        n        = min(len(labels), len(prior_counts))
+        p_x      = labels[:n]
+        p_y      = list(prior_counts.values)[:n]
+        p_labels = list(prior_labels)[:n]
+        fig.add_trace(go.Scatter(
+            x=p_x,
+            y=p_y,
+            mode="lines",
+            line=dict(dash="dot", color=LIGHT_BLUE, width=2),
+            opacity=0.7,
+            name="Prior period",
+            customdata=p_labels,
+            hovertemplate="Prior %{customdata}: %{y:,} visits<extra></extra>",
+            showlegend=True,
+        ))
+
     fig.update_layout(
         title="Activity Trends Over Time",
         yaxis_title="Visits",
@@ -312,6 +347,7 @@ def build_activity_chart(labels, counts, log_scale):
         margin=dict(t=50, b=20, l=60, r=20),
         plot_bgcolor="rgba(0,0,0,0)",
         paper_bgcolor="rgba(0,0,0,0)",
+        legend=dict(x=1, y=1, xanchor="right", bgcolor="rgba(0,0,0,0)"),
     )
     return fig
 
@@ -395,6 +431,67 @@ def build_top_visitors_chart(labels, visits):
         paper_bgcolor="rgba(0,0,0,0)",
     )
     return fig
+
+
+def render_location_callouts(loc_desc):
+    scored = loc_desc[loc_desc["health_score"].notna()]
+    if len(scored) < 2:
+        return
+    best  = scored.loc[scored["health_score"].idxmax()]
+    worst = scored.loc[scored["health_score"].idxmin()]
+    if best.name == worst.name or best["health_score"] == worst["health_score"]:
+        return
+
+    def _card(row, label, bg, border_color, takeaway, val_color, label_color):
+        score    = int(row["health_score"]) if row["health_score"] is not None else "—"
+        visits   = f"{int(row['visits']):,}"
+        custs    = f"{int(row['customers']):,}"
+        loyal    = row.get("loyal_pct", "—")
+        lapsed   = row.get("lapsed_pct", "—")
+        loc_name = _html.escape(str(row["Location"]))
+        return f"""
+        <div style="background:{bg};border-left:4px solid {border_color};
+                    border-radius:6px;padding:16px 20px;height:100%;">
+          <p style="font-size:10px;font-weight:700;letter-spacing:0.08em;
+                    text-transform:uppercase;margin:0 0 6px 0;color:{border_color};">
+            {label}
+          </p>
+          <p style="font-size:16px;font-weight:700;margin:0 0 8px 0;
+                    color:{PRIMARY_NAVY};">{loc_name}</p>
+          <p style="margin:0 0 12px 0;">
+            <span style="font-size:32px;font-weight:700;color:{PRIMARY_NAVY};">{score}</span>
+            <span style="font-size:14px;color:#666;"> / 100 Health Score</span>
+          </p>
+          <div style="display:flex;gap:20px;font-size:12px;margin-bottom:12px;">
+            <div><div style="font-weight:700;color:{val_color};">{visits}</div><div style="color:{label_color};">Visits</div></div>
+            <div><div style="font-weight:700;color:{val_color};">{custs}</div><div style="color:{label_color};">Customers</div></div>
+            <div><div style="font-weight:700;color:{val_color};">{loyal}</div><div style="color:{label_color};">Loyal %</div></div>
+            <div><div style="font-weight:700;color:{val_color};">{lapsed}</div><div style="color:{label_color};">Lapsed %</div></div>
+          </div>
+          <p style="font-size:12px;color:#555;margin:0;">{takeaway}</p>
+        </div>
+        """
+
+    st.subheader("Top Performer vs Biggest Opportunity")
+    st.caption(
+        "Where to celebrate and where to focus. Compare the gap between your strongest "
+        "and weakest kiosks to see what's possible at every location."
+    )
+    col_l, col_r = st.columns([1, 1])
+    with col_l:
+        st.markdown(
+            _card(best, "Top Performer", "#f0f7ff", LIGHT_BLUE,
+                  "Strongest retention of your kiosks. Look at what they're doing differently and replicate it.",
+                  val_color=PRIMARY_NAVY, label_color="rgba(30,58,107,0.65)"),
+            unsafe_allow_html=True,
+        )
+    with col_r:
+        st.markdown(
+            _card(worst, "Biggest Opportunity", "#fff8e6", "#f59e0b",
+                  "Weakest retention of your kiosks. This is where a fix has the most leverage.",
+                  val_color="#92400e", label_color="rgba(146,64,14,0.65)"),
+            unsafe_allow_html=True,
+        )
 
 
 def render_location_performance(df):
@@ -586,6 +683,8 @@ def render_location_performance(df):
         ),
     }
 
+    render_location_callouts(loc_desc)
+
     st.dataframe(table_df, column_config=col_cfg, width="stretch", hide_index=True)
 
 
@@ -611,11 +710,111 @@ def render_top_visitors(df):
         .sort_values("visits", ascending=True)  # ascending → largest at top in Plotly
     )
 
-    labels = [mask_phone(m, reveal) for m in top20["Mobile"]]
-    visits = top20["visits"].tolist()
+    top20_desc = (
+        df.groupby("Mobile").size()
+        .reset_index(name="visits")
+        .nlargest(20, "visits")
+        .sort_values("visits", ascending=False)
+        .reset_index(drop=True)
+    )
+
+    labels = [mask_phone(m, reveal) for m in top20_desc["Mobile"]]
+    visits = top20_desc["visits"].tolist()
+
+    chart_order = top20_desc.sort_values("visits", ascending=True)
+    chart_labels = [mask_phone(m, reveal) for m in chart_order["Mobile"]]
+    chart_visits = chart_order["visits"].tolist()
 
     with st.container(border=True):
-        st.plotly_chart(build_top_visitors_chart(labels, visits), width="stretch")
+        st.plotly_chart(build_top_visitors_chart(chart_labels, chart_visits), width="stretch")
+
+    # ── Customer drill-in ─────────────────────────────────────────────────────
+    drill_options = ["Pick a customer to see their full history"] + [
+        f"{mask_phone(m, reveal)} — {v:,} visits"
+        for m, v in zip(top20_desc["Mobile"], top20_desc["visits"])
+    ]
+    selected = st.selectbox(
+        "Drill into a customer",
+        drill_options,
+        index=0,
+        key=f"top_visitor_selected_{reveal}",
+    )
+
+    if selected != drill_options[0]:
+        sel_idx  = drill_options.index(selected) - 1
+        sel_mob  = top20_desc["Mobile"].iloc[sel_idx]
+        cust_df  = df[df["Mobile"].astype(str) == str(sel_mob)].copy()
+
+        if not cust_df.empty:
+            phone_display = mask_phone(sel_mob, reveal)
+            lv_count      = len(cust_df)
+
+            first_visit = last_visit = days_as_cust = days_since = "N/A"
+            if "Date" in cust_df.columns:
+                dates_c    = pd.to_datetime(cust_df["Date"], errors="coerce").dropna()
+                if not dates_c.empty:
+                    first_dt    = dates_c.min()
+                    last_dt     = dates_c.max()
+                    first_visit = first_dt.strftime("%b %-d, %Y")
+                    last_visit  = last_dt.strftime("%b %-d, %Y")
+                    days_as_cust = (last_dt.date() - first_dt.date()).days
+                    days_since   = (date.today() - last_dt.date()).days
+
+            points_row = ""
+            if "Total Points" in cust_df.columns:
+                last_pts = cust_df.sort_values("Date").iloc[-1].get("Total Points", "—")
+                points_row = f"<tr><td><b>Total Points</b></td><td>{last_pts:,}</td></tr>" if isinstance(last_pts, (int, float)) else f"<tr><td><b>Total Points</b></td><td>{last_pts}</td></tr>"
+
+            action_rows = ""
+            if "Action" in cust_df.columns:
+                action_counts = cust_df["Action"].apply(parse_action_label).value_counts()
+                action_rows = "".join(
+                    f"<tr><td><b>{_html.escape(a)}</b></td><td>{c}</td></tr>"
+                    for a, c in action_counts.items()
+                )
+
+            loc_rows = ""
+            if "Location" in cust_df.columns:
+                unique_locs_cust = cust_df["Location"].dropna().unique()
+                if len(unique_locs_cust) > 0:
+                    loc_list = ", ".join(_html.escape(str(l)) for l in sorted(unique_locs_cust))
+                    loc_rows = f"<tr><td><b>Locations Visited</b></td><td>{loc_list}</td></tr>"
+
+            st.markdown(
+                f"""
+                <div style="background:#f0f7ff;border-left:4px solid {MID_BLUE};
+                            border-radius:4px;padding:16px 20px;margin-top:8px;color:{PRIMARY_NAVY};">
+                  <p style="font-size:16px;font-weight:700;margin:0 0 12px 0;">
+                    {_html.escape(phone_display)}
+                  </p>
+                  <table style="font-size:13px;border-collapse:collapse;width:100%;">
+                    <tr><td style="padding:2px 16px 2px 0;width:200px;"><b>Lifetime Visits</b></td>
+                        <td>{lv_count:,}</td></tr>
+                    <tr><td><b>First Visit</b></td><td>{first_visit}</td></tr>
+                    <tr><td><b>Last Visit</b></td><td>{last_visit}</td></tr>
+                    <tr><td><b>Days as Customer</b></td><td>{days_as_cust}</td></tr>
+                    <tr><td><b>Days Since Last Visit</b></td><td>{days_since}</td></tr>
+                    {points_row}
+                    {action_rows}
+                    {loc_rows}
+                  </table>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+            # Visit history table
+            hist_cols = ["Date"]
+            if "Location" in cust_df.columns:
+                hist_cols.append("Location")
+            hist_cols.append("Action")
+            if "Points Awarded" in cust_df.columns:
+                hist_cols.append("Points Awarded")
+
+            hist_df = cust_df[hist_cols].copy()
+            hist_df["Action"] = hist_df["Action"].apply(parse_action_label)
+            hist_df = hist_df.sort_values("Date", ascending=False).reset_index(drop=True)
+            st.dataframe(hist_df, hide_index=True, width="stretch")
 
 
 def bin_to_range_label(bin_mins):
@@ -1674,9 +1873,12 @@ def render_filters(df):
 
 # ── PDF report ────────────────────────────────────────────────────────────────
 
-def _make_numbered_canvas(max_date_str):
-    """Return a Canvas subclass that stamps 'Page X of Y' on every page."""
+def _make_numbered_canvas(today_str, logo_path, logo_w, logo_h, page_titles):
+    """Return a Canvas subclass with per-page headers and a three-column footer."""
     from reportlab.pdfgen import canvas as rl_canvas
+    from reportlab.lib.colors import HexColor
+
+    PAGE_H = 792  # letter height in points
 
     class _Canvas(rl_canvas.Canvas):
         def __init__(self, *args, **kwargs):
@@ -1691,14 +1893,43 @@ def _make_numbered_canvas(max_date_str):
             total = len(self._saved_pages)
             for state in self._saved_pages:
                 self.__dict__.update(state)
-                self.setFont("Helvetica", 8)
+
+                # ── per-page header (skip cover = page 1) ────────────────────
+                pg_idx   = self._pageNumber - 1
+                pg_title = page_titles[pg_idx] if pg_idx < len(page_titles) else ""
+                if pg_title and os.path.exists(logo_path):
+                    self.drawImage(
+                        logo_path, 36, PAGE_H - 50,
+                        width=logo_w, height=logo_h,
+                        preserveAspectRatio=True, mask="auto",
+                    )
+                    pipe_x  = 36 + logo_w + 10
+                    title_x = pipe_x + 14
+                    mid_y   = PAGE_H - 50 + logo_h / 2 - 5
+                    self.setFont("Helvetica", 14)
+                    self.setFillColorRGB(0.67, 0.67, 0.67)
+                    self.drawString(pipe_x, mid_y, "|")
+                    self.setFont("Helvetica-Bold", 13)
+                    self.setFillColor(HexColor(PRIMARY_NAVY))
+                    self.drawString(title_x, mid_y, pg_title)
+                    self.setStrokeColor(HexColor(MID_BLUE))
+                    self.setLineWidth(1)
+                    self.line(36, PAGE_H - 58, 576, PAGE_H - 58)
+
+                # ── three-column footer ───────────────────────────────────────
+                self.setStrokeColorRGB(0.8, 0.8, 0.8)
+                self.setLineWidth(0.5)
+                self.line(36, 36, 576, 36)
+
+                self.setFont("Helvetica-Bold", 9)
+                self.setFillColor(HexColor(PRIMARY_NAVY))
+                self.drawString(36, 22, "OPTSPOT LOYALTY ANALYTICS")
+
+                self.setFont("Helvetica", 9)
                 self.setFillColorRGB(0.55, 0.55, 0.55)
-                self.drawCentredString(
-                    306, 18,
-                    f"Generated by OptSpot Loyalty Analytics  •  "
-                    f"Page {self._pageNumber} of {total}  •  "
-                    f"Data through {max_date_str}",
-                )
+                self.drawCentredString(306, 22, f"Page {self._pageNumber} of {total}")
+                self.drawRightString(576, 22, today_str)
+
                 super().showPage()
             super().save()
 
@@ -1781,7 +2012,7 @@ def build_pdf_actions(df):
     return actions
 
 
-def generate_pdf(df, wash_name, prepared_for):
+def generate_pdf(df, wash_name, prepared_for, cover_note=None):
     """Build the PDF and return its bytes. Raises RuntimeError if deps missing."""
     try:
         from reportlab.platypus import (
@@ -1792,21 +2023,24 @@ def generate_pdf(df, wash_name, prepared_for):
         from reportlab.lib.pagesizes import letter
         from reportlab.lib.units import inch
         from reportlab.lib.colors import HexColor
+        from reportlab.lib.utils import ImageReader
     except ImportError:
         raise RuntimeError(
             "reportlab is not installed. Run: pip install reportlab kaleido"
         )
 
-    NAVY   = HexColor(PRIMARY_NAVY)
-    GREY   = HexColor("#333333")
-    LTGREY = HexColor("#888888")
-    BGBLUE = HexColor("#f0f2f6")
-    RULE   = HexColor("#cccccc")
-    ARROW  = HexColor(MID_BLUE)
+    NAVY      = HexColor(PRIMARY_NAVY)
+    MIDBLUE_C = HexColor(MID_BLUE)
+    GREY      = HexColor("#333333")
+    LTGREY    = HexColor("#888888")
+    WHITE     = HexColor("#FFFFFF")
+    BGBLUE    = HexColor("#f0f7ff")
+    RULE      = HexColor("#cccccc")
 
-    W = 540  # content width in points (7.5" with 0.5" margins each side)
+    W = 540  # content width in points (7.5" with 0.75" margins each side)
 
-    def ps(name, size, color=GREY, bold=False, space_after=6, leading=None, left_indent=0):
+    def ps(name, size, color=GREY, bold=False, space_after=6, leading=None,
+           left_indent=0, alignment=0, keep_with_next=False):
         return ParagraphStyle(
             name,
             fontSize=size,
@@ -1815,19 +2049,36 @@ def generate_pdf(df, wash_name, prepared_for):
             spaceAfter=space_after,
             leading=leading or max(size + 4, 14),
             leftIndent=left_indent,
+            alignment=alignment,
+            keepWithNext=keep_with_next,
         )
 
-    sty_report_label = ps("rl",  9, LTGREY)
-    sty_title        = ps("ti", 28, NAVY,  bold=True,  space_after=8,  leading=32)
-    sty_wash         = ps("wn", 20, NAVY,  bold=True,  space_after=6,  leading=24)
-    sty_meta         = ps("mt", 10, GREY,  space_after=4)
-    sty_h1           = ps("h1", 16, NAVY,  bold=True,  space_after=10, leading=20)
-    sty_h2           = ps("h2", 13, NAVY,  bold=True,  space_after=6,  leading=17)
-    sty_body         = ps("bd", 10, GREY,  space_after=5)
-    sty_bullet       = ps("bu", 10, GREY,  space_after=7, left_indent=14, leading=15)
-    sty_action       = ps("ac", 10, GREY,  space_after=10, left_indent=20, leading=15)
-    sty_kpi_val      = ps("kv", 22, NAVY,  bold=True,  space_after=2,  leading=26)
-    sty_kpi_lbl      = ps("kl",  9, LTGREY, space_after=0)
+    sty_title        = ps("ti", 32, NAVY,      bold=True,  space_after=8,  leading=36)
+    sty_wash         = ps("wn", 22, NAVY,      bold=True,  space_after=6,  leading=26)
+    sty_meta         = ps("mt", 12, GREY,      space_after=4)
+    sty_h1           = ps("h1", 16, NAVY,      bold=True,  space_after=6,  leading=20, keep_with_next=True)
+    sty_h2           = ps("h2", 13, NAVY,      bold=True,  space_after=6,  leading=17, keep_with_next=True)
+    sty_body         = ps("bd", 10, GREY,      space_after=5)
+    sty_bullet_card  = ps("bc", 12, NAVY,      space_after=0, leading=17)
+    sty_action       = ps("ac", 10, GREY,      space_after=10, left_indent=20, leading=15)
+    sty_kpi_val      = ps("kv", 28, MIDBLUE_C, bold=True,  space_after=4,  leading=32)
+    sty_kpi_lbl      = ps("kl", 10, NAVY,      bold=True,  space_after=0)
+    sty_caption      = ps("cp", 11, NAVY,      space_after=12)
+    sty_closing_body = ps("cb", 12, GREY,      space_after=14, leading=18)
+    sty_tagline      = ps("tg", 14, WHITE,     bold=True,  space_after=0, alignment=1)
+
+    # ── logo aspect ratio ─────────────────────────────────────────────────────
+    logo_path   = os.path.join(os.path.dirname(os.path.abspath(__file__)), "optspot_logo_dark.png")
+    _cov_logo_w = 240
+    _cov_logo_h = 60        # fallback
+    _hdr_logo_w = 80
+    _hdr_logo_h = 20        # fallback
+    if os.path.exists(logo_path):
+        _ir = ImageReader(logo_path)
+        _iw, _ih = _ir.getSize()
+        if _iw > 0:
+            _cov_logo_h = _cov_logo_w * _ih / _iw
+            _hdr_logo_h = _hdr_logo_w * _ih / _iw
 
     # ── shared data ───────────────────────────────────────────────────────────
     kpis    = compute_kpis(df)
@@ -1841,9 +2092,8 @@ def generate_pdf(df, wash_name, prepared_for):
     if len(dates_series):
         min_date_str = dates_series.min().strftime("%b %-d, %Y")
         max_date_str = dates_series.max().strftime("%b %-d, %Y")
-        max_date_raw = dates_series.max().strftime("%b %-d, %Y")
     else:
-        min_date_str = max_date_str = max_date_raw = "N/A"
+        min_date_str = max_date_str = "N/A"
 
     today_str = date.today().strftime("%B %-d, %Y")
 
@@ -1859,82 +2109,118 @@ def generate_pdf(df, wash_name, prepared_for):
                 sty_body,
             )
 
+    def section_header(text):
+        return KeepTogether([
+            Paragraph(text, sty_h1),
+            HRFlowable(width=W, thickness=3, color=MIDBLUE_C, spaceAfter=0),
+            Spacer(1, 10),
+        ])
+
+    def bullet_card(text):
+        tbl = Table(
+            [[Paragraph(_html.escape(text), sty_bullet_card)]],
+            colWidths=[W - 4],
+        )
+        tbl.setStyle(TableStyle([
+            ("BACKGROUND",    (0, 0), (-1, -1), BGBLUE),
+            ("LINEBEFORE",    (0, 0), (0,  -1), 4, MIDBLUE_C),
+            ("LEFTPADDING",   (0, 0), (-1, -1), 12),
+            ("RIGHTPADDING",  (0, 0), (-1, -1), 10),
+            ("TOPPADDING",    (0, 0), (-1, -1), 8),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+        ]))
+        return [tbl, Spacer(1, 6)]
+
+    # page_titles[n-1] = header text for page n; "" = no header (cover = page 1)
+    page_titles = [""]
+
     # ── PAGE 1 — Cover / Executive Summary ───────────────────────────────────
     story = []
 
-    logo_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "optspot_logo_dark.png")
     if os.path.exists(logo_path):
-        logo_img = Image(logo_path, width=200, height=50)
-        logo_tbl = Table([[logo_img]], colWidths=[W])
-        logo_tbl.setStyle(TableStyle([("ALIGN", (0, 0), (-1, -1), "CENTER")]))
-        story.append(logo_tbl)
-        story.append(Spacer(1, 20))
-
-    story.append(Paragraph("OPTSPOT LOYALTY ANALYTICS", sty_report_label))
-    story.append(Spacer(1, 14))
+        cov_logo        = Image(logo_path, width=_cov_logo_w, height=_cov_logo_h)
+        cov_logo.hAlign = "CENTER"
+        story.append(Spacer(1, 12))
+        story.append(cov_logo)
+    story.append(Spacer(1, 24))
     story.append(Paragraph("Loyalty Performance Report", sty_title))
     story.append(Paragraph(_html.escape(wash_name), sty_wash))
 
     if prepared_for:
         story.append(Paragraph(f"Prepared for: {_html.escape(prepared_for)}", sty_meta))
+    if cover_note:
+        story.append(Paragraph(f"<i>{_html.escape(cover_note)}</i>", sty_meta))
 
     story.append(Paragraph(f"Period: {min_date_str} – {max_date_str}", sty_meta))
     story.append(Paragraph(f"Generated {today_str}", sty_meta))
-    story.append(Spacer(1, 16))
-    story.append(HRFlowable(width=W, thickness=1, color=RULE, spaceAfter=16))
+    story.append(Spacer(1, 24))
+    story.append(HRFlowable(width=W, thickness=4, color=MIDBLUE_C, spaceAfter=0))
+    story.append(Spacer(1, 24))
 
     story.append(Paragraph("Executive Summary", sty_h1))
     for b in bullets:
-        story.append(
-            Paragraph(
-                f'<font color="{MID_BLUE}">→</font>  {_html.escape(b)}',
-                sty_bullet,
-            )
-        )
+        story.extend(bullet_card(b))
 
     story.append(PageBreak())
+    page_titles.append("Key Metrics")  # page 2
 
-    # ── PAGE 2 — Key Metrics + Activity Chart ─────────────────────────────────
-    story.append(Paragraph("Key Metrics", sty_h1))
+    # ── PAGE 2 — Key Metrics + Activity Chart ────────────────────────────────
+    story.append(section_header("Key Metrics"))
 
     def kpi_cell(label, value):
         return [
             Paragraph(_html.escape(str(value)), sty_kpi_val),
-            Paragraph(_html.escape(label),      sty_kpi_lbl),
+            Paragraph(label.upper(),             sty_kpi_lbl),
         ]
 
     kpi_data = [
-        [kpi_cell("TOTAL VISITS",          f"{kpis['total_visits']:,}"),
-         kpi_cell("UNIQUE CUSTOMERS",      f"{kpis['unique_customers']:,}")],
-        [kpi_cell("AVG VISITS / CUSTOMER", str(kpis["avg_visits"])),
-         kpi_cell("PEAK DAY",              kpis["peak_display"])],
+        [kpi_cell("Total Visits",          f"{kpis['total_visits']:,}"),
+         kpi_cell("Unique Customers",      f"{kpis['unique_customers']:,}")],
+        [kpi_cell("Avg Visits / Customer", str(kpis["avg_visits"])),
+         kpi_cell("Peak Day",              kpis["peak_display"])],
     ]
     kpi_tbl = Table(kpi_data, colWidths=[W / 2, W / 2])
     kpi_tbl.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, -1), BGBLUE),
-        ("BOX",        (0, 0), (-1, -1), 0.5,  RULE),
-        ("INNERGRID",  (0, 0), (-1, -1), 0.5,  RULE),
-        ("TOPPADDING", (0, 0), (-1, -1), 14),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 14),
+        ("BACKGROUND",    (0, 0), (-1, -1), BGBLUE),
+        ("BOX",           (0, 0), (-1, -1), 1,  MIDBLUE_C),
+        ("INNERGRID",     (0, 0), (-1, -1), 1,  MIDBLUE_C),
+        ("TOPPADDING",    (0, 0), (-1, -1), 16),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 16),
         ("LEFTPADDING",   (0, 0), (-1, -1), 16),
         ("RIGHTPADDING",  (0, 0), (-1, -1), 16),
-        ("VALIGN",     (0, 0), (-1, -1), "MIDDLE"),
+        ("VALIGN",        (0, 0), (-1, -1), "MIDDLE"),
     ]))
     story.append(kpi_tbl)
     story.append(Spacer(1, 20))
 
     if "Date" in df.columns:
-        story.append(Paragraph("Activity Over Time", sty_h1))
+        story.append(section_header("Activity Over Time"))
         labels, counts = aggregate_visits(df, "Day")
         fig_act = build_activity_chart(labels, counts, log_scale=False)
         fig_act.update_layout(title="", margin=dict(t=20, b=40, l=60, r=20))
-        story.append(chart_image(fig_act, W, 200))
+        act_img = chart_image(fig_act, W, 200)
+        act_cap = None
+        if len(labels) > 0 and len(counts) > 0:
+            peak_pos = int(counts.values.argmax())
+            act_cap  = (
+                f"Trend shows {len(labels)}-day activity window. "
+                f"Peak day was {labels[peak_pos]} with {int(counts.iloc[peak_pos]):,} visits."
+            )
+        if act_cap:
+            story.append(KeepTogether([
+                act_img,
+                Spacer(1, 6),
+                Paragraph(f"<i>{_html.escape(act_cap)}</i>", sty_caption),
+            ]))
+        else:
+            story.append(act_img)
 
     story.append(PageBreak())
 
     # ── PAGE 3 — Cohort Retention ─────────────────────────────────────────────
     if "Mobile" in df.columns and "Date" in df.columns:
-        story.append(Paragraph("Customer Retention by Cohort", sty_h1))
+        page_titles.append("Customer Retention by Cohort")
+        story.append(section_header("Customer Retention by Cohort"))
         pct_pivot, count_pivot, cohort_sizes = compute_cohort_retention(df)
 
         if not pct_pivot.empty:
@@ -1945,9 +2231,11 @@ def generate_pdf(df, wash_name, prepared_for):
                 height=ch_h,
                 margin=dict(t=20, b=20, l=180, r=20),
             )
-            story.append(chart_image(fig_cohort, W, ch_h * (W / 1200), px_w=1200, px_h=ch_h * 2))
-            story.append(Spacer(1, 10))
-            story.append(Paragraph(cohort_headline(pct_pivot), sty_body))
+            cohort_img = chart_image(fig_cohort, W, ch_h * (W / 1200), px_w=1200, px_h=ch_h * 2)
+            cohort_cap = Paragraph(
+                f"<i>{_html.escape(cohort_headline(pct_pivot))}</i>", sty_caption
+            )
+            story.append(KeepTogether([cohort_img, Spacer(1, 10), cohort_cap]))
         else:
             story.append(Paragraph(
                 "Not enough data to build a cohort chart — "
@@ -1956,15 +2244,29 @@ def generate_pdf(df, wash_name, prepared_for):
             ))
 
         story.append(PageBreak())
+        page_titles.append("Visit Patterns")
+    else:
+        page_titles.append("Visit Patterns")
 
     # ── PAGE 4 — Visit Patterns ───────────────────────────────────────────────
-    story.append(Paragraph("Visit Patterns", sty_h1))
+    story.append(section_header("Visit Patterns"))
 
     if "Mobile" in df.columns:
         story.append(Paragraph("How Often Customers Come Back", sty_h2))
         fig_freq = build_frequency_chart(df)
         fig_freq.update_layout(title="", margin=dict(t=20, b=40, l=60, r=20))
-        story.append(chart_image(fig_freq, W, 210))
+        freq_img = chart_image(fig_freq, W, 210)
+        vc       = df.groupby("Mobile").size()
+        od_pct   = round(int((vc <= 2).sum()) / len(vc) * 100) if len(vc) else 0
+        freq_cap = (
+            f"{od_pct}% of customers visited 1–2 times. "
+            "Loyalty cliff visible at the left."
+        )
+        story.append(KeepTogether([
+            freq_img,
+            Spacer(1, 6),
+            Paragraph(f"<i>{_html.escape(freq_cap)}</i>", sty_caption),
+        ]))
         story.append(Spacer(1, 14))
 
     if "Time" in df.columns:
@@ -1974,16 +2276,22 @@ def generate_pdf(df, wash_name, prepared_for):
         t_counts = bin_mins.value_counts().sort_index()
         fig_times = build_popular_times_chart(t_counts)
         fig_times.update_layout(title="", margin=dict(t=20, b=40, l=60, r=20))
-        story.append(chart_image(fig_times, W, 180))
-        insight = popular_times_insight(t_counts)
+        times_img = chart_image(fig_times, W, 180)
+        insight   = popular_times_insight(t_counts)
         if insight:
-            story.append(Spacer(1, 6))
-            story.append(Paragraph(insight, sty_body))
+            story.append(KeepTogether([
+                times_img,
+                Spacer(1, 6),
+                Paragraph(f"<i>{_html.escape(insight)}</i>", sty_caption),
+            ]))
+        else:
+            story.append(times_img)
 
     story.append(PageBreak())
+    page_titles.append("Recommended Actions")
 
     # ── PAGE 5 — Recommended Actions ─────────────────────────────────────────
-    story.append(Paragraph("Recommended Actions", sty_h1))
+    story.append(section_header("Recommended Actions"))
     story.append(Paragraph(
         "Based on your data, here are the highest-leverage steps to take next:",
         sty_body,
@@ -1992,9 +2300,23 @@ def generate_pdf(df, wash_name, prepared_for):
 
     for i, action in enumerate(actions, 1):
         story.append(Paragraph(
-            f'<b>{i}.</b>  {_html.escape(action)}',
+            f'<b>{i}.</b>  {_html.escape(action)}',
             sty_action,
         ))
+
+    story.append(Spacer(1, 24))
+
+    tagline_tbl = Table(
+        [[Paragraph("WORK HARD. PLAY HARD. NO DRAMA.", sty_tagline)]],
+        colWidths=[W],
+    )
+    tagline_tbl.setStyle(TableStyle([
+        ("BACKGROUND",    (0, 0), (-1, -1), MIDBLUE_C),
+        ("ALIGN",         (0, 0), (-1, -1), "CENTER"),
+        ("TOPPADDING",    (0, 0), (-1, -1), 20),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 20),
+    ]))
+    story.append(tagline_tbl)
 
     # ── Build PDF ─────────────────────────────────────────────────────────────
     buf = io.BytesIO()
@@ -2003,50 +2325,14 @@ def generate_pdf(df, wash_name, prepared_for):
         pagesize=letter,
         leftMargin=0.5 * inch,
         rightMargin=0.5 * inch,
-        topMargin=0.5 * inch,
-        bottomMargin=0.6 * inch,  # slightly taller for footer
+        topMargin=0.75 * inch,
+        bottomMargin=0.6 * inch,
     )
-    doc.build(story, canvasmaker=_make_numbered_canvas(max_date_raw))
+    doc.build(story, canvasmaker=_make_numbered_canvas(
+        today_str, logo_path, _hdr_logo_w, _hdr_logo_h, page_titles,
+    ))
     return buf.getvalue()
 
-
-def render_report_expander(df):
-    with st.expander("Generate Customer Report"):
-        wash_name    = st.text_input(
-            "Car wash name",
-            placeholder="e.g. Bubba's Express Wash",
-            key="pdf_wash_name",
-        )
-        prepared_for = st.text_input(
-            "Prepared for (optional)",
-            placeholder="e.g. John Smith, Owner",
-            key="pdf_prepared_for",
-        )
-
-        if st.button("Generate Report (PDF)", type="primary", key="pdf_generate_btn"):
-            if not wash_name.strip():
-                st.error("Enter a car wash name before generating.")
-            else:
-                with st.spinner("Building report — exporting charts…"):
-                    try:
-                        pdf_bytes = generate_pdf(df, wash_name.strip(), prepared_for.strip())
-                        st.session_state["pdf_bytes"] = pdf_bytes
-                        slug = re.sub(r"[^a-z0-9]+", "-", wash_name.lower()).strip("-")
-                        st.session_state["pdf_filename"] = (
-                            f"loyalty-report-{slug}-{date.today().strftime('%Y-%m-%d')}.pdf"
-                        )
-                    except RuntimeError as exc:
-                        st.error(str(exc))
-                        st.session_state.pop("pdf_bytes", None)
-
-        if st.session_state.get("pdf_bytes"):
-            st.download_button(
-                "⬇ Download PDF",
-                data=st.session_state["pdf_bytes"],
-                file_name=st.session_state.get("pdf_filename", "loyalty-report.pdf"),
-                mime="application/pdf",
-                key="pdf_download_btn",
-            )
 
 
 def page_dashboard():
@@ -2086,8 +2372,8 @@ def page_dashboard():
         return
 
     st.caption(build_filter_summary(df, df_filtered))
+    st.caption("Want to share this data as a report? Head to **Dispatcher** in the sidebar.")
 
-    render_report_expander(df_filtered)
     render_data_quality(df_filtered)
 
     st.divider()
@@ -2196,8 +2482,15 @@ def page_dashboard():
                 "of the next busiest period. Try Log scale to see the rest of the trend."
             )
 
+    prior_labels_act = prior_counts_act = None
+    if prior_result and not prior_result["df"].empty:
+        prior_labels_act, prior_counts_act = aggregate_visits(prior_result["df"], period)
+
     with st.container(border=True):
-        st.plotly_chart(build_activity_chart(labels, counts, log_scale), width="stretch")
+        st.plotly_chart(
+            build_activity_chart(labels, counts, log_scale, prior_labels_act, prior_counts_act),
+            width="stretch",
+        )
 
     if "Mobile" in df_filtered.columns:
         st.divider()
@@ -2433,12 +2726,333 @@ def page_directory():
     st.info("Coming soon.")
 
 
+def _load_dispatch_log():
+    if not os.path.exists(DISPATCH_LOG_PATH):
+        return pd.DataFrame(columns=DISPATCH_LOG_COLS)
+    try:
+        return pd.read_csv(DISPATCH_LOG_PATH, dtype=str).fillna("")
+    except Exception:
+        return pd.DataFrame(columns=DISPATCH_LOG_COLS)
+
+
+def _append_dispatch_log(row):
+    try:
+        file_exists = os.path.exists(DISPATCH_LOG_PATH)
+        with open(DISPATCH_LOG_PATH, "a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=DISPATCH_LOG_COLS)
+            if not file_exists:
+                writer.writeheader()
+            writer.writerow({k: row.get(k, "") for k in DISPATCH_LOG_COLS})
+    except Exception:
+        pass
+
+
+def _dispatch_pdf_path(slug):
+    return os.path.join(DISPATCH_PDF_DIR, f"{slug}.pdf")
+
+
+def _timestamp_slug():
+    return datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
+
+
+def _validate_recipients(recip_df):
+    valid = []
+    for _, row in recip_df.iterrows():
+        name  = str(row.get("Name",  "")).strip()
+        email = str(row.get("Email", "")).strip()
+        if email and _EMAIL_RE.match(email):
+            valid.append({"name": name, "email": email})
+    return valid
+
+
 def page_dispatcher():
     st.header("Dispatcher")
-    st.caption("Send targeted campaigns to customer segments.")
+    st.caption(
+        "Generate location-specific reports for operators or stakeholders. "
+        "Each dispatch is logged and downloadable."
+    )
     st.divider()
     render_status_line()
-    st.info("Coming soon.")
+
+    df = st.session_state.get("loaded_data")
+    if df is None or df.empty:
+        st.info("No data loaded — upload a file from Import Files to get started.")
+        return
+
+    all_locations = (
+        sorted(df["Location"].dropna().unique().tolist())
+        if "Location" in df.columns else []
+    )
+
+    # ── Configuration section ─────────────────────────────────────────────────
+    col_form, col_summary = st.columns([3, 2])
+
+    with col_form:
+        st.markdown("**Step 1 — Select Kiosks**")
+        selected_locs = st.multiselect(
+            "Kiosks",
+            options=all_locations,
+            default=all_locations,
+            help="Pick the kiosks to include. Recipients only see data for these locations.",
+            key="disp_kiosks",
+            label_visibility="collapsed",
+        )
+
+        st.markdown("**Step 2 — Sender Info**")
+        s1, s2 = st.columns(2)
+        sender_name  = s1.text_input("Sender name",  key="disp_sender_name",  placeholder="Your name")
+        sender_email = s2.text_input("Sender email", key="disp_sender_email", placeholder="you@example.com")
+
+        st.markdown("**Step 3 — Recipients**")
+        recip_df = st.data_editor(
+            pd.DataFrame({"Name": [""], "Email": [""]}),
+            num_rows="dynamic",
+            key="disp_recipients",
+            use_container_width=True,
+        )
+        valid_recipients = _validate_recipients(recip_df)
+
+        st.markdown("**Step 4 — Customize**")
+        wash_name  = st.text_input(
+            "Car wash name *", key="disp_wash_name",
+            placeholder="e.g. Bubba's Express Wash",
+        )
+        cover_note = st.text_area(
+            "Cover note (optional)", key="disp_cover_note",
+            height=80,
+            placeholder="Short note to appear on the cover page…",
+        )
+
+        can_dispatch = (
+            bool(selected_locs)
+            and bool(wash_name.strip())
+            and bool(valid_recipients)
+            and bool(sender_name.strip())
+            and bool(sender_email.strip())
+        )
+        dispatch_clicked = st.button(
+            "Generate & Dispatch Report (PDF)",
+            type="primary",
+            disabled=not can_dispatch,
+            use_container_width=True,
+            key="disp_dispatch_btn",
+        )
+
+    with col_summary:
+        with st.container(border=True):
+            if not selected_locs:
+                st.caption("Pick at least one kiosk to see the dispatch summary.")
+            else:
+                df_scope = (
+                    df[df["Location"].isin(selected_locs)]
+                    if "Location" in df.columns else df
+                )
+                total_locs = len(all_locations)
+                sel_locs   = len(selected_locs)
+                uniq_cust  = df_scope["Mobile"].nunique() if "Mobile" in df_scope.columns else "—"
+
+                if "Date" in df_scope.columns:
+                    dates = pd.to_datetime(df_scope["Date"], errors="coerce").dropna()
+                    date_range = (
+                        f"{dates.min().strftime('%b %-d, %Y')} – {dates.max().strftime('%b %-d, %Y')}"
+                        if len(dates) else "—"
+                    )
+                else:
+                    date_range = "—"
+
+                st.markdown(
+                    f"""
+**Dispatch Summary**
+
+| | |
+|---|---|
+| Kiosks | {sel_locs} of {total_locs} |
+| Records included | {len(df_scope):,} |
+| Unique customers | {f"{uniq_cust:,}" if isinstance(uniq_cust, int) else uniq_cust} |
+| Date range | {date_range} |
+| Recipients | {len(valid_recipients)} |
+""",
+                    unsafe_allow_html=False,
+                )
+
+    # ── Dispatch action ───────────────────────────────────────────────────────
+    if dispatch_clicked:
+        df_scope = (
+            df[df["Location"].isin(selected_locs)]
+            if "Location" in df.columns else df
+        )
+        prepared_for_str = "; ".join(
+            r["name"] if r["name"] else r["email"] for r in valid_recipients
+        )
+        slug = _timestamp_slug()
+
+        with st.spinner("Building report — exporting charts…"):
+            try:
+                pdf_bytes = generate_pdf(
+                    df_scope,
+                    wash_name.strip(),
+                    prepared_for_str,
+                    cover_note.strip() or None,
+                )
+            except RuntimeError as exc:
+                st.error(str(exc))
+                st.stop()
+
+        st.session_state["last_dispatch_pdf"]  = pdf_bytes
+        st.session_state["last_dispatch_slug"] = slug
+        _fn = f"loyalty-report-{re.sub(r'[^a-z0-9]+', '-', wash_name.lower()).strip('-')}-{slug}.pdf"
+        st.session_state["last_dispatch_filename"] = _fn
+
+        # Persist PDF to disk
+        disk_ok = True
+        try:
+            os.makedirs(DISPATCH_PDF_DIR, exist_ok=True)
+            with open(_dispatch_pdf_path(slug), "wb") as f:
+                f.write(pdf_bytes)
+        except Exception:
+            disk_ok = False
+
+        # Log the dispatch
+        _append_dispatch_log({
+            "timestamp":        slug,
+            "sender_name":      sender_name.strip(),
+            "sender_email":     sender_email.strip(),
+            "recipient_names":  "; ".join(r["name"]  for r in valid_recipients),
+            "recipient_emails": "; ".join(r["email"] for r in valid_recipients),
+            "locations":        "; ".join(selected_locs),
+            "kiosk_count":      str(len(selected_locs)),
+            "record_count":     str(len(df_scope)),
+            "wash_name":        wash_name.strip(),
+        })
+
+        if not disk_ok:
+            st.warning(
+                "PDF generated but couldn't be saved to disk. "
+                "The download below works, but re-download from history won't."
+            )
+
+        st.toast(
+            f"Report generated for {wash_name.strip()} "
+            f"covering {len(selected_locs)} kiosk(s). Download below."
+        )
+        st.rerun()
+
+    if st.session_state.get("last_dispatch_pdf"):
+        st.download_button(
+            "⬇ Download Dispatched Report",
+            data=st.session_state["last_dispatch_pdf"],
+            file_name=st.session_state.get("last_dispatch_filename", "loyalty-report.pdf"),
+            mime="application/pdf",
+            key="disp_download_btn",
+        )
+
+    # ── Dispatch History ──────────────────────────────────────────────────────
+    st.divider()
+    st.subheader("Dispatch History")
+
+    log_df = _load_dispatch_log()
+
+    if log_df.empty:
+        st.info("No dispatches yet. Generate your first report above.")
+    else:
+        log_df = log_df.sort_values("timestamp", ascending=False).reset_index(drop=True)
+        show_all = st.session_state.get("disp_show_all_history", False)
+        display_df = log_df if show_all else log_df.head(50)
+
+        def _fmt_ts(ts):
+            try:
+                return datetime.strptime(ts, "%Y-%m-%dT%H-%M-%S").strftime("%b %-d, %Y at %-I:%M %p")
+            except Exception:
+                return ts
+
+        def _fmt_recipients(names, emails):
+            parts = [n.strip() for n in names.split(";") if n.strip()]
+            if not parts:
+                parts = [e.strip() for e in emails.split(";") if e.strip()]
+            count = len(parts)
+            preview = "; ".join(parts[:2])
+            return f"{count} — {preview}" if count <= 2 else f"{count} — {preview}…"
+
+        table_rows = []
+        for _, row in display_df.iterrows():
+            table_rows.append({
+                "When":       _fmt_ts(row.get("timestamp", "")),
+                "Sender":     row.get("sender_name", ""),
+                "Recipients": _fmt_recipients(
+                    row.get("recipient_names", ""),
+                    row.get("recipient_emails", ""),
+                ),
+                "Locations":  (
+                    f"{row.get('kiosk_count', '?')} kiosk(s) — "
+                    + "; ".join(row.get("locations", "").split(";")[:2])
+                    + ("…" if row.get("locations", "").count(";") >= 2 else "")
+                ),
+                "Records":    row.get("record_count", ""),
+            })
+
+        st.dataframe(
+            pd.DataFrame(table_rows),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        if not show_all and len(log_df) > 50:
+            if st.button(f"Show all {len(log_df)} dispatches", key="disp_show_all_btn"):
+                st.session_state["disp_show_all_history"] = True
+                st.rerun()
+
+        # Re-download selectbox
+        st.markdown("**Re-download a past dispatch**")
+        slug_options = {
+            _fmt_ts(row.get("timestamp", "")) + f" — {row.get('wash_name', '')}": row.get("timestamp", "")
+            for _, row in display_df.iterrows()
+        }
+        chosen_label = st.selectbox(
+            "Select dispatch",
+            options=["— select —"] + list(slug_options.keys()),
+            key="disp_redownload_select",
+            label_visibility="collapsed",
+        )
+        if chosen_label != "— select —":
+            chosen_slug = slug_options[chosen_label]
+            pdf_path    = _dispatch_pdf_path(chosen_slug)
+            if os.path.exists(pdf_path):
+                with open(pdf_path, "rb") as f:
+                    st.download_button(
+                        "⬇ Download",
+                        data=f.read(),
+                        file_name=f"loyalty-report-{chosen_slug}.pdf",
+                        mime="application/pdf",
+                        key=f"disp_redownload_{chosen_slug}",
+                    )
+            else:
+                st.warning("PDF file not found — it may have been deleted.")
+
+    # ── Clear history ─────────────────────────────────────────────────────────
+    with st.expander("Danger zone"):
+        if st.button("Clear dispatch history", key="disp_clear_btn", type="secondary"):
+            st.session_state["disp_confirm_clear"] = True
+
+    if st.session_state.get("disp_confirm_clear"):
+        st.warning(
+            "This will permanently delete all dispatch history and saved PDF files. "
+            "This cannot be undone."
+        )
+        cc1, cc2 = st.columns(2)
+        if cc1.button("Yes, delete everything", type="primary", key="disp_clear_confirm"):
+            try:
+                if os.path.exists(DISPATCH_LOG_PATH):
+                    os.remove(DISPATCH_LOG_PATH)
+                if os.path.exists(DISPATCH_PDF_DIR):
+                    shutil.rmtree(DISPATCH_PDF_DIR, ignore_errors=True)
+            except Exception:
+                pass
+            st.session_state.pop("disp_confirm_clear", None)
+            st.session_state.pop("disp_show_all_history", None)
+            st.rerun()
+        if cc2.button("Cancel", key="disp_clear_cancel"):
+            st.session_state.pop("disp_confirm_clear", None)
+            st.rerun()
 
 
 def page_import():

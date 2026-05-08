@@ -5,3 +5,5 @@ __pycache__/
 .streamlit/secrets.toml
 *.log
 current_data.csv
+dispatch_log.csv
+dispatch_pdfs/
