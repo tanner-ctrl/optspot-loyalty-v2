@@ -57,6 +57,31 @@ DISPATCH_LOG_COLS = [
 
 _EMAIL_RE = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
 
+TXNDATA_PATH = os.path.join(_APP_DIR, "current_transactions.csv")
+
+TXN_DROP_COLS = {"customer_name", "employee_first_name", "employee_last_name", "employee_name"}
+
+TXN_SCHEMA_FIELDS = [
+    "license_plate", "wash_date", "Subtotal", "visit_type",
+    "Membership Name", "location", "invoice_id", "Discounts", "Status", "discount_name",
+]
+TXN_REQUIRED_FIELDS = {"license_plate"}
+
+TXN_COLUMN_ALIASES = {
+    "license_plate":   ["license_plate", "plate", "license plate", "licenseplate"],
+    "wash_date":       ["wash_date", "date", "transaction_date", "txn_date", "wash date"],
+    "Subtotal":        ["subtotal", "sub_total", "sub total", "amount", "total"],
+    "visit_type":      ["visit_type", "type", "service_type", "visit type"],
+    "Membership Name": ["membership name", "membership", "plan", "plan_name", "membershipname"],
+    "location":        ["location", "site", "kiosk"],
+    "invoice_id":      ["invoice_id", "invoice", "id", "transaction_id", "invoice id"],
+    "Discounts":       ["discounts", "discount"],
+    "Status":          ["status"],
+    "discount_name":   ["discount_name", "discount name", "promo"],
+}
+
+LOYALTY_TIER_ORDER = ["VIP", "Regular", "One-and-Done", "Non-Member"]
+
 FILTER_DEFAULTS = {
     "filter_preset":        "All time",
     "filter_date_start":    None,
@@ -156,6 +181,51 @@ def auto_match(file_cols, schema_field):
     return None
 
 
+def _txn_auto_match(file_cols, field):
+    aliases = [a.lower() for a in TXN_COLUMN_ALIASES.get(field, [field.lower()])]
+    for col in file_cols:
+        if col.strip().lower() in aliases:
+            return col
+    return None
+
+
+def normalize_plate(val):
+    if pd.isna(val) or not str(val).strip():
+        return None
+    cleaned = re.sub(r"[^A-Z0-9]", "", str(val).upper().strip())
+    return cleaned or None
+
+
+def get_txn_data_span_days(df_txn):
+    """Return the time span in days covered by the transaction data."""
+    if "wash_date" not in df_txn.columns or df_txn.empty:
+        return None
+    dates = pd.to_datetime(df_txn["wash_date"], errors="coerce").dropna()
+    if dates.empty:
+        return None
+    span = (dates.max() - dates.min()).days + 1
+    return max(span, 1)
+
+
+def identify_outlier_mobiles(df, min_visits=21, min_span=60, max_span=270):
+    if "Mobile" not in df.columns or "Date" not in df.columns:
+        return set()
+    dt   = pd.to_datetime(df["Date"], errors="coerce")
+    work = df.assign(_dt=dt).dropna(subset=["_dt", "Mobile"])
+    grp  = work.groupby("Mobile")["_dt"].agg(
+        visit_count="size",
+        first_visit="min",
+        last_visit="max",
+    )
+    grp["span_days"] = (grp["last_visit"] - grp["first_visit"]).dt.days
+    outliers = grp[
+        (grp["visit_count"] >= min_visits)
+        & (grp["span_days"] >= min_span)
+        & (grp["span_days"] <= max_span)
+    ]
+    return set(outliers.index)
+
+
 def _password_hash(pw):
     return hashlib.sha256(pw.encode()).hexdigest()
 
@@ -216,22 +286,41 @@ def _render_login():
 
 # Auto-load data once per session — imported file takes priority over sample
 if "loaded_data" not in st.session_state:
-    _base      = os.path.dirname(os.path.abspath(__file__))
-    _curr_path = os.path.join(_base, "current_data.csv")
-    _samp_path = os.path.join(_base, "sample_data.csv")
+    _curr_path = os.path.join(_APP_DIR, "current_data.csv")
+    _samp_path = os.path.join(_APP_DIR, "sample_data.csv")
     if os.path.exists(_curr_path):
         _df = pd.read_csv(_curr_path, index_col=False)
         _df = _df.dropna(axis=1, how="all")
-        st.session_state["loaded_data"] = split_datetime_column(_df)
-        st.session_state["auto_loaded"] = "imported"
+        _df = split_datetime_column(_df)
+        if "License Plate" in _df.columns and "license_plate_norm" not in _df.columns:
+            _df["license_plate_norm"] = _df["License Plate"].apply(normalize_plate)
+        st.session_state["loaded_data"]    = _df
+        st.session_state["outlier_mobiles"] = identify_outlier_mobiles(_df)
+        st.session_state["auto_loaded"]     = "imported"
     elif os.path.exists(_samp_path):
         _df = pd.read_csv(_samp_path, index_col=False)
         _df = _df.dropna(axis=1, how="all")
-        st.session_state["loaded_data"] = split_datetime_column(_df)
-        st.session_state["auto_loaded"] = "sample"
+        _df = split_datetime_column(_df)
+        if "License Plate" in _df.columns and "license_plate_norm" not in _df.columns:
+            _df["license_plate_norm"] = _df["License Plate"].apply(normalize_plate)
+        st.session_state["loaded_data"]    = _df
+        st.session_state["outlier_mobiles"] = identify_outlier_mobiles(_df)
+        st.session_state["auto_loaded"]    = "sample"
     else:
-        st.session_state["loaded_data"] = None
-        st.session_state["auto_loaded"] = False
+        st.session_state["loaded_data"]    = None
+        st.session_state["outlier_mobiles"] = set()
+        st.session_state["auto_loaded"]    = False
+
+if "transaction_data" not in st.session_state:
+    if os.path.exists(TXNDATA_PATH):
+        _txn = pd.read_csv(TXNDATA_PATH, index_col=False)
+        _txn.drop(columns=[c for c in TXN_DROP_COLS if c in _txn.columns],
+                  errors="ignore", inplace=True)
+        if "license_plate" in _txn.columns and "license_plate_norm" not in _txn.columns:
+            _txn["license_plate_norm"] = _txn["license_plate"].apply(normalize_plate)
+        st.session_state["transaction_data"] = _txn
+    else:
+        st.session_state["transaction_data"] = None
 
 # ── Auth gate ─────────────────────────────────────────────────────────────────
 if not st.session_state.get("authenticated"):
@@ -244,11 +333,31 @@ if not st.session_state.get("authenticated"):
 
 
 def render_status_line():
-    df = st.session_state.get("loaded_data")
-    if df is not None:
-        st.caption(f"{len(df):,} records loaded")
-    else:
+    df_l = st.session_state.get("loaded_data")
+    df_t = st.session_state.get("transaction_data")
+
+    if df_l is None and df_t is None:
         st.caption("No data loaded — upload a file to get started.")
+        return
+
+    parts = []
+    if df_l is not None:
+        parts.append(f"{len(df_l):,} loyalty records")
+    else:
+        parts.append("No loyalty data loaded")
+
+    if df_t is not None:
+        parts.append(f"{len(df_t):,} transaction records")
+        if (df_l is not None
+                and "license_plate_norm" in df_l.columns
+                and "license_plate_norm" in df_t.columns):
+            lp = set(df_l["license_plate_norm"].dropna())
+            tp = set(df_t["license_plate_norm"].dropna())
+            parts.append(f"{len(lp & tp):,} plates matched")
+    else:
+        parts.append("No transaction data loaded")
+
+    st.caption(" · ".join(parts))
 
 
 # ── Sidebar ──────────────────────────────────────────────────────────────────
@@ -258,7 +367,7 @@ st.sidebar.caption("OPTSPOT LOYALTY ANALYTICS")
 
 page = st.sidebar.radio(
     "Navigation",
-    ["Dashboard", "Retention", "Directory", "Dispatcher", "Import Files"],
+    ["Dashboard", "Retention", "Cross-Reference", "Dispatcher", "Import Files"],
 )
 
 _auto = st.session_state.get("auto_loaded")
@@ -354,19 +463,26 @@ def build_activity_chart(labels, counts, log_scale, prior_labels=None, prior_cou
 
 def build_frequency_chart(df):
     visit_counts    = df.groupby("Mobile").size()
-    max_tier        = int(visit_counts.max())
-    tier_range      = range(1, max_tier + 1)
+    actual_max      = int(visit_counts.max())
+    display_max     = min(actual_max, int(visit_counts.median() * 3 + 10))
+    has_overflow    = display_max < actual_max
+    overflow_threshold = display_max + 1 if has_overflow else None
+
+    tier_range      = range(1, display_max + 1)
     tier_cust       = visit_counts.value_counts().reindex(tier_range, fill_value=0)
     total_customers = len(visit_counts)
     total_visits    = len(df)
 
-    colors, texts, customdata = [], [], []
+    x_vals, y_vals, colors, texts, customdata = [], [], [], [], []
+
     for t in tier_range:
-        n_custs  = int(tier_cust[t])
-        n_visits = n_custs * t
+        n_custs   = int(tier_cust[t])
+        n_visits  = n_custs * t
         cust_pct  = n_custs / total_customers * 100 if total_customers else 0
         visit_pct = n_visits / total_visits * 100 if total_visits else 0
 
+        x_vals.append(t)
+        y_vals.append(n_custs)
         texts.append(
             f"{cust_pct:.0f}% of customers<br>{visit_pct:.0f}% of visits"
             if n_custs > 0 else ""
@@ -380,26 +496,52 @@ def build_frequency_chart(df):
         else:
             colors.append(PRIMARY_NAVY)
 
+    if has_overflow:
+        overflow_custs  = int((visit_counts > display_max).sum())
+        overflow_visits = int(visit_counts[visit_counts > display_max].sum())
+        cust_pct  = overflow_custs / total_customers * 100 if total_customers else 0
+        visit_pct = overflow_visits / total_visits * 100 if total_visits else 0
+        x_vals.append(overflow_threshold)
+        y_vals.append(overflow_custs)
+        texts.append(
+            f"{cust_pct:.0f}% of customers<br>{visit_pct:.0f}% of visits"
+            if overflow_custs > 0 else ""
+        )
+        customdata.append(overflow_custs)
+        colors.append(PRIMARY_NAVY)
+
+    tick_vals = list(range(1, display_max + 1))
+    tick_text = [str(i) for i in tick_vals]
+    if has_overflow:
+        tick_vals.append(overflow_threshold)
+        tick_text.append(f"{overflow_threshold}+")
+
+    hover = (
+        "%{customdata:,} customers visited %{x}+ times<extra></extra>"
+        if has_overflow
+        else "%{customdata:,} customers visited %{x} times<extra></extra>"
+    )
+
     fig = go.Figure(go.Bar(
-        x=list(tier_range),
-        y=tier_cust.values,
+        x=x_vals,
+        y=y_vals,
         text=texts,
         textposition="outside",
         textfont=dict(size=10),
         customdata=customdata,
-        hovertemplate="%{customdata:,} customers visited %{x} times<extra></extra>",
+        hovertemplate=hover,
         marker_color=colors,
     ))
     fig.update_layout(
         xaxis_title="Number of Visits",
         yaxis_title="Number of Customers",
-        xaxis=dict(tickmode="linear", dtick=1),
+        xaxis=dict(tickmode="array", tickvals=tick_vals, ticktext=tick_text),
         height=450,
         margin=dict(t=60, b=20, l=60, r=20),
         plot_bgcolor="rgba(0,0,0,0)",
         paper_bgcolor="rgba(0,0,0,0)",
     )
-    return fig
+    return fig, overflow_threshold
 
 
 def mask_phone(mobile, reveal):
@@ -1477,7 +1619,26 @@ def detect_data_quality(df):
                 ),
             })
 
-    # 7. All healthy
+    # 7. Internal test accounts filtered
+    _outliers = st.session_state.get("outlier_mobiles", set())
+    if _outliers and st.session_state.get("exclude_outliers", True):
+        _full_df  = st.session_state.get("loaded_data")
+        _n_records = (
+            int((_full_df["Mobile"].isin(_outliers)).sum())
+            if _full_df is not None and "Mobile" in _full_df.columns
+            else "?"
+        )
+        issues.append({
+            "severity": "info",
+            "title":    "Internal test accounts filtered out.",
+            "body": (
+                f"{len(_outliers)} customers ({_n_records:,} loyalty records) excluded because they "
+                "had more than 20 visits within a 2–9 month span — pattern matches internal test "
+                "accounts from the platform's development phase. Use Data Settings to adjust."
+            ),
+        })
+
+    # 8. All healthy
     if not issues:
         issues.append({
             "severity": "info",
@@ -1586,8 +1747,20 @@ def compute_kpis(df, prior_df=None):
     }
 
 
-def get_filtered_data():
+def get_clean_loaded_data():
     df = st.session_state.get("loaded_data")
+    if df is None or df.empty:
+        return df
+    if not st.session_state.get("exclude_outliers", True):
+        return df
+    outliers = st.session_state.get("outlier_mobiles", set())
+    if not outliers or "Mobile" not in df.columns:
+        return df
+    return df[~df["Mobile"].isin(outliers)]
+
+
+def get_filtered_data():
+    df = get_clean_loaded_data()
     if df is None or df.empty:
         return pd.DataFrame()
 
@@ -1746,6 +1919,53 @@ def build_filter_summary(df_full, df_filtered):
 
     suffix = (" — " + ", ".join(parts)) if parts else ""
     return f"Showing {filtered:,} of {total:,} records{suffix}."
+
+
+def render_data_settings():
+    full_df = st.session_state.get("loaded_data")
+    if full_df is None:
+        return
+
+    with st.expander("Data Settings (advanced)", expanded=False):
+        exclude = st.toggle(
+            "Exclude internal test accounts (recommended)",
+            value=True,
+            key="exclude_outliers",
+        )
+
+        if exclude:
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                min_v = st.number_input(
+                    "Min visits threshold",
+                    min_value=5, max_value=100,
+                    value=st.session_state.get("outlier_min_visits", 21),
+                    key="outlier_min_visits",
+                )
+            with col2:
+                min_s = st.number_input(
+                    "Min span (days)",
+                    min_value=1, max_value=730,
+                    value=st.session_state.get("outlier_min_span", 60),
+                    key="outlier_min_span",
+                )
+            with col3:
+                max_s = st.number_input(
+                    "Max span (days)",
+                    min_value=1, max_value=730,
+                    value=st.session_state.get("outlier_max_span", 270),
+                    key="outlier_max_span",
+                )
+
+            new_outliers = identify_outlier_mobiles(full_df, min_v, min_s, max_s)
+            if new_outliers != st.session_state.get("outlier_mobiles", set()):
+                st.session_state["outlier_mobiles"] = new_outliers
+
+            n_out = len(st.session_state.get("outlier_mobiles", set()))
+            st.caption(
+                f"Current rule: exclude customers with {min_v}+ visits whose visit history spans "
+                f"{min_s}–{max_s} days. {n_out} customer{'s' if n_out != 1 else ''} currently filtered out."
+            )
 
 
 def render_filters(df):
@@ -2347,6 +2567,8 @@ def page_dashboard():
         st.info("No data yet — upload a file from Import Files to see your metrics.")
         return
 
+    render_data_settings()
+
     st.markdown(
         """
         <style>
@@ -2500,12 +2722,120 @@ def page_dashboard():
                 "Distribution of customer visit counts. Most loyalty programs see a heavy "
                 "left skew — that's normal. The goal is to grow the middle and right."
             )
-            st.plotly_chart(build_frequency_chart(df_filtered), width="stretch")
+
+            fig_freq, overflow_threshold = build_frequency_chart(df_filtered)
+            freq_event = st.plotly_chart(
+                fig_freq,
+                width="stretch",
+                on_select="rerun",
+                selection_mode="points",
+                key="freq_chart_select",
+            )
+
             st.markdown(
                 "**Light blue: One-and-Done customers (1–2 visits)** — your biggest growth opportunity.  \n"
                 "**Medium blue: Regulars (3–9 visits)** — your loyal core.  \n"
                 "**Dark blue: VIPs (10+ visits)** — your champions. Send them rewards."
             )
+            st.caption("Click a bar to see which customers fall in that visit count.")
+
+            # ── Drill-down panel ──────────────────────────────────────────────
+            sel_points = (
+                freq_event.get("selection", {}).get("points", [])
+                if isinstance(freq_event, dict)
+                else []
+            )
+            selected_x = None
+            if sel_points:
+                try:
+                    selected_x = int(sel_points[0]["x"])
+                except (KeyError, TypeError, ValueError):
+                    selected_x = None
+
+            if selected_x is not None:
+                visit_counts_series = df_filtered.groupby("Mobile").size()
+                is_overflow = overflow_threshold is not None and selected_x >= overflow_threshold
+                if is_overflow:
+                    drill_mobiles = visit_counts_series[
+                        visit_counts_series >= overflow_threshold
+                    ].index
+                else:
+                    drill_mobiles = visit_counts_series[
+                        visit_counts_series == selected_x
+                    ].index
+
+                st.divider()
+                drill_col1, drill_col2 = st.columns([6, 1])
+                with drill_col1:
+                    n_drill = len(drill_mobiles)
+                    if is_overflow:
+                        visit_label = f"{overflow_threshold}+ visits"
+                        tier_label  = "VIP"
+                    else:
+                        visit_label = f"exactly {selected_x} visit{'s' if selected_x != 1 else ''}"
+                        if selected_x <= 2:
+                            tier_label = "One-and-Done"
+                        elif selected_x <= 9:
+                            tier_label = "Regular"
+                        else:
+                            tier_label = "VIP"
+                    st.markdown(
+                        f"**{n_drill:,} customers with {visit_label}**"
+                        f" — {tier_label}"
+                    )
+                with drill_col2:
+                    if st.button("✕ Clear", key="freq_drill_clear"):
+                        st.session_state.pop("freq_chart_select", None)
+                        st.rerun()
+
+                reveal_phones = st.toggle(
+                    "Reveal phone numbers",
+                    value=False,
+                    key="freq_drill_reveal",
+                )
+
+                drill_rows = []
+                for mob in drill_mobiles:
+                    cust_df = df_filtered[df_filtered["Mobile"] == mob]
+                    last_dt = (
+                        pd.to_datetime(cust_df["Date"], errors="coerce").max()
+                        if "Date" in cust_df.columns
+                        else None
+                    )
+                    if "Total Points" in cust_df.columns:
+                        _tp = cust_df["Total Points"].iloc[-1]
+                        pts = int(_tp) if pd.notna(_tp) else None
+                    else:
+                        pts = None
+                    plate = (
+                        cust_df["License Plate"].iloc[-1]
+                        if "License Plate" in cust_df.columns
+                        else None
+                    )
+                    drill_rows.append({
+                        "Customer": mask_phone(mob, reveal_phones),
+                        "Visits": selected_x,
+                        "Last Visit": last_dt.strftime("%Y-%m-%d") if pd.notna(last_dt) else "—",
+                        "Points": pts if pts is not None else "—",
+                        "License Plate": plate if plate else "—",
+                    })
+
+                drill_df = pd.DataFrame(drill_rows).sort_values("Last Visit", ascending=False)
+                points_available = any(r["Points"] != "—" for r in drill_rows)
+                if not points_available:
+                    drill_df = drill_df.drop(columns=["Points"])
+                st.dataframe(drill_df, width="stretch", hide_index=True)
+                if not points_available:
+                    st.caption("Total Points data unavailable in this export.")
+
+                csv_bytes = drill_df.to_csv(index=False).encode("utf-8")
+                st.download_button(
+                    label=f"Download {n_drill:,} customer{'s' if n_drill != 1 else ''} as CSV",
+                    data=csv_bytes,
+                    file_name=f"customers_{selected_x}_visits.csv",
+                    mime="text/csv",
+                    key="freq_drill_download",
+                )
 
     if "Action" in df_filtered.columns:
         st.divider()
@@ -2718,12 +3048,976 @@ def page_retention():
         st.caption("CSV contains full phone numbers — download to a private folder.")
 
 
-def page_directory():
-    st.header("Directory")
-    st.caption("Look up an individual customer.")
+def _compute_cross_reference(df_loyalty, df_txn, date_start, date_end):
+    """Pure computation — no Streamlit calls. Returns analysis dict."""
+    df_txn_f = df_txn.copy()
+
+    # Filter transactions by date
+    if "wash_date" in df_txn_f.columns and (date_start or date_end):
+        wash_dates = pd.to_datetime(df_txn_f["wash_date"], errors="coerce")
+        if date_start:
+            df_txn_f = df_txn_f[wash_dates >= pd.Timestamp(date_start)]
+        if date_end:
+            df_txn_f = df_txn_f[wash_dates <= pd.Timestamp(date_end)]
+
+    lp = "license_plate_norm"
+
+    # Annualization factor for avg-visit metrics
+    span_days        = get_txn_data_span_days(df_txn_f)
+    annualize_factor = 365.0 / span_days if span_days else 1.0
+    has_wash_date_col = span_days is not None
+    txn_date_min = txn_date_max = None
+    if has_wash_date_col:
+        _wd = pd.to_datetime(df_txn_f["wash_date"], errors="coerce").dropna()
+        if not _wd.empty:
+            txn_date_min = _wd.min().strftime("%-d %b %Y")
+            txn_date_max = _wd.max().strftime("%-d %b %Y")
+
+    # Loyalty plate visit counts — FULL history (unfiltered)
+    loyalty_plate_visits = {}
+    if lp in df_loyalty.columns:
+        loyalty_plate_visits = df_loyalty.groupby(lp).size().to_dict()
+
+    loyalty_plates_all = set(loyalty_plate_visits.keys())
+
+    # Most recent Mobile per plate — a shared vehicle may have multiple mobiles; use latest entry
+    plate_to_mobile: dict = {}
+    if lp in df_loyalty.columns and "Mobile" in df_loyalty.columns:
+        _mob_df = df_loyalty[[lp, "Mobile"]].dropna(subset=[lp, "Mobile"])
+        if "Date" in df_loyalty.columns:
+            _mob_df = df_loyalty[[lp, "Mobile", "Date"]].dropna(subset=[lp, "Mobile"]).sort_values("Date")
+        plate_to_mobile = _mob_df.groupby(lp)["Mobile"].last().to_dict()
+
+    # Transaction plates (filtered)
+    txn_plates    = set(df_txn_f[lp].dropna()) if lp in df_txn_f.columns else set()
+    member_plates = txn_plates & loyalty_plates_all
+    total_plates  = len(txn_plates)
+
+    # Overall match rate (for low-match warning)
+    denom = min(len(loyalty_plates_all), total_plates)
+    match_rate = len(member_plates) / denom if denom else 0.0
+
+    # Revenue by tier
+    has_subtotal = False
+    tier_df      = pd.DataFrame()
+
+    if lp in df_txn_f.columns and total_plates > 0:
+        plate_visits_s = pd.Series(loyalty_plate_visits, dtype=int)
+        df_txn_f = df_txn_f.copy()
+        df_txn_f["_visits"] = df_txn_f[lp].map(plate_visits_s).fillna(0).astype(int)
+        df_txn_f["_tier"] = pd.cut(
+            df_txn_f["_visits"],
+            bins=[-1, 0, 2, 9, 10_000_000],
+            labels=["Non-Member", "One-and-Done", "Regular", "VIP"],
+        )
+
+        has_subtotal = (
+            "Subtotal" in df_txn_f.columns
+            and pd.to_numeric(df_txn_f["Subtotal"], errors="coerce").notna().any()
+        )
+        if has_subtotal:
+            df_txn_f["_sub"] = pd.to_numeric(df_txn_f["Subtotal"], errors="coerce").fillna(0)
+
+        agg = {
+            "Plates":       (lp, "nunique"),
+            "Transactions": (lp, "count"),
+        }
+        if has_subtotal:
+            agg["Total Revenue"] = ("_sub", "sum")
+
+        tier_df = (
+            df_txn_f.groupby("_tier", observed=False)
+            .agg(**agg)
+            .reindex(LOYALTY_TIER_ORDER)
+            .reset_index()
+            .rename(columns={"_tier": "Tier"})
+        )
+        if has_subtotal:
+            tier_df["Avg Revenue / Plate"] = (
+                tier_df["Total Revenue"] / tier_df["Plates"].replace(0, float("nan"))
+            )
+            tier_df["Avg Revenue / Visit"] = (
+                tier_df["Total Revenue"] / tier_df["Transactions"].replace(0, float("nan"))
+            )
+
+    # ── Wash Club / Membership computations ───────────────────────────────────
+    has_membership_col = False
+    paid_plates_set    = set()
+
+    if "Membership Name" in df_txn_f.columns and lp in df_txn_f.columns:
+        mn = df_txn_f["Membership Name"].fillna("").astype(str).str.strip()
+        if (mn != "").any():
+            has_membership_col = True
+            paid_plates_set = set(df_txn_f.loc[mn != "", lp].dropna())
+
+    crosstab = {}
+    if has_membership_col:
+        crosstab = {
+            "retail_only":  len(txn_plates - loyalty_plates_all - paid_plates_set),
+            "loyalty_only": len(member_plates - paid_plates_set),
+            "member_only":  len(paid_plates_set - loyalty_plates_all),
+            "full_funnel":  len(paid_plates_set & loyalty_plates_all),
+        }
+
+    # Membership tier breakdown
+    membership_tier_df = pd.DataFrame()
+    if has_membership_col:
+        paid_txns = df_txn_f[df_txn_f[lp].isin(paid_plates_set)].copy()
+        paid_txns["_mn"] = paid_txns["Membership Name"].fillna("").astype(str).str.strip()
+        paid_txns = paid_txns[paid_txns["_mn"] != ""]
+        if not paid_txns.empty:
+            plate_primary = (
+                paid_txns.groupby(lp)["_mn"]
+                .agg(lambda x: x.value_counts().index[0])
+                .reset_index()
+                .rename(columns={"_mn": "Tier Name"})
+            )
+            tier_members = plate_primary.groupby("Tier Name").size().rename("Members").reset_index()
+            tier_txns    = paid_txns.groupby("_mn").size().rename("Transactions").reset_index().rename(columns={"_mn": "Tier Name"})
+            membership_tier_df = tier_members.merge(tier_txns, on="Tier Name", how="left")
+            membership_tier_df["Avg Visits / Member"] = (
+                membership_tier_df["Transactions"] / membership_tier_df["Members"].replace(0, float("nan"))
+            ).round(1)
+            tier_loyalty: dict = {}
+            for _, row in plate_primary.iterrows():
+                t = row["Tier Name"]
+                if t not in tier_loyalty:
+                    tier_loyalty[t] = {"in_loyalty": 0, "total": 0}
+                tier_loyalty[t]["total"] += 1
+                if row[lp] in loyalty_plates_all:
+                    tier_loyalty[t]["in_loyalty"] += 1
+            membership_tier_df["Loyalty Overlap"] = membership_tier_df["Tier Name"].apply(
+                lambda t: tier_loyalty.get(t, {}).get("in_loyalty", 0) / max(1, tier_loyalty.get(t, {}).get("total", 1))
+            )
+            membership_tier_df = membership_tier_df.sort_values("Members", ascending=False).reset_index(drop=True)
+
+    # Behavioral comparison: members vs retail
+    def _seg_stats(plates: set) -> dict:
+        if not plates:
+            return {}
+        seg = df_txn_f[df_txn_f[lp].isin(plates)]
+        if seg.empty:
+            return {}
+        plate_counts = seg.groupby(lp).size()
+        avg_visits   = round(float(plate_counts.mean()) * annualize_factor, 1)
+
+        top_visit_type = None
+        if "visit_type" in seg.columns:
+            vc = seg["visit_type"].dropna().value_counts()
+            if not vc.empty:
+                top_visit_type = {"name": str(vc.index[0]), "count": int(vc.iloc[0]),
+                                  "pct": round(vc.iloc[0] / len(seg) * 100, 1)}
+
+        top_days: list = []
+        if "wash_date" in seg.columns:
+            dts = pd.to_datetime(seg["wash_date"], errors="coerce").dropna()
+            if not dts.empty:
+                _day_names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+                for idx, cnt in dts.dt.dayofweek.value_counts().head(2).items():
+                    top_days.append({"name": _day_names[int(idx)], "pct": round(cnt / len(dts) * 100, 1)})
+
+        time_bucket = None
+        for col in seg.columns:
+            if "time" in col.lower() and col.lower() not in ("wash_date",):
+                times = pd.to_datetime("2000-01-01 " + seg[col].astype(str), errors="coerce").dropna()
+                if not times.empty:
+                    def _bucket(h: int) -> str:
+                        if 6 <= h < 12: return "Morning (6am–noon)"
+                        if 12 <= h < 16: return "Afternoon (noon–4pm)"
+                        if 16 <= h < 20: return "Evening (4pm–8pm)"
+                        return "Late (8pm–6am)"
+                    bkts = times.dt.hour.apply(_bucket).value_counts()
+                    time_bucket = {"name": str(bkts.index[0]), "pct": round(bkts.iloc[0] / len(times) * 100, 1)}
+                break
+
+        median_span = None
+        if "wash_date" in seg.columns:
+            dts2 = pd.to_datetime(seg["wash_date"], errors="coerce")
+            spans = seg.assign(_dt=dts2).groupby(lp)["_dt"].agg(lambda x: (x.max() - x.min()).days)
+            median_span = int(spans.median())
+
+        return {"avg_visits": avg_visits, "top_visit_type": top_visit_type,
+                "top_days": top_days, "time_bucket": time_bucket,
+                "median_span_days": median_span, "n_plates": len(plates)}
+
+    members_vs_retail: dict = {}
+    if has_membership_col:
+        retail_plates = txn_plates - paid_plates_set
+        members_vs_retail = {
+            "members": _seg_stats(paid_plates_set),
+            "retail":  _seg_stats(retail_plates),
+        }
+
+    return {
+        "df_txn_f":             df_txn_f,
+        "loyalty_plate_visits": loyalty_plate_visits,
+        "plate_to_mobile":      plate_to_mobile,
+        "match_rate":           match_rate,
+        "total_plates":         total_plates,
+        "member_plates":        len(member_plates),
+        "tier_df":              tier_df,
+        "has_subtotal":         has_subtotal,
+        # annualization
+        "span_days":            span_days,
+        "has_wash_date_col":    has_wash_date_col,
+        "txn_date_min":         txn_date_min,
+        "txn_date_max":         txn_date_max,
+        # wash club
+        "has_membership_col":   has_membership_col,
+        "paid_plates_count":    len(paid_plates_set),
+        "crosstab":             crosstab,
+        "membership_tier_df":   membership_tier_df,
+        "members_vs_retail":    members_vs_retail,
+        # crosstab drill-down plate sets
+        "retail_only_plates":   txn_plates - loyalty_plates_all - paid_plates_set,
+        "loyalty_only_plates":  member_plates - paid_plates_set,
+        "member_only_plates":   paid_plates_set - loyalty_plates_all,
+        "full_funnel_plates":   paid_plates_set & loyalty_plates_all,
+        "annualize_factor":     annualize_factor,
+    }
+
+
+def page_cross_reference():
+    st.header("Cross-Reference Insights")
+    st.caption(
+        "Loyalty data + wash transactions, joined on license plate. "
+        "See revenue impact of retention, find membership upsell targets, and measure conversion."
+    )
     st.divider()
     render_status_line()
-    st.info("Coming soon.")
+
+    df_loyalty = get_clean_loaded_data()
+    df_txn     = st.session_state.get("transaction_data")
+
+    # Guards
+    if df_loyalty is None or df_loyalty.empty:
+        st.info("Upload loyalty data via Import Files to begin.")
+        return
+    if df_txn is None or df_txn.empty:
+        st.info(
+            "Upload wash transaction data via Import Files to enable cross-reference insights. "
+            "This page joins loyalty events to transactions on license plate."
+        )
+        return
+    if "license_plate_norm" not in df_loyalty.columns:
+        st.warning(
+            "Cross-reference requires license plates in your loyalty data. "
+            "Re-import using a kiosk submission export with the License Plate column populated."
+        )
+        return
+    if "license_plate_norm" not in df_txn.columns:
+        st.warning(
+            "Transaction data is missing the license_plate column. "
+            "Re-import and map it in the Column Mapping step."
+        )
+        return
+
+    # Date range from global filters
+    date_start = st.session_state.get("filter_date_start")
+    date_end   = st.session_state.get("filter_date_end")
+
+    st.caption(
+        "Loyalty visit counts use full history. "
+        "Transaction metrics respect the active date range filter."
+    )
+
+    with st.expander("Understanding This Page", expanded=False):
+        st.markdown("""
+#### How the data joins
+This page connects two datasets — your loyalty kiosk submissions and your wash transaction log — using the **license plate** as the join key. Plates are normalized (uppercase, no spaces, no special characters) before matching so "ABC-123" and "abc 123" count as the same vehicle. Only plates that appear in **both** datasets count as "matched" — anyone in only one dataset shows up in their respective bucket but not the cross-references.
+
+#### What "Conversion" means here
+Conversion rate is the share of wash customers who also showed up at the kiosk and signed up for loyalty. A customer who visits your wash but never engages with the kiosk is a non-member. A customer whose plate appears in both is a loyalty member. The higher the conversion, the better your kiosk and signup experience is working.
+
+#### What loyalty tiers mean
+Tiers are based on **lifetime visit counts** in the loyalty data:
+- **VIP** = 10 or more loyalty visits
+- **Regular** = 3 to 9 loyalty visits
+- **One-and-Done** = 1 or 2 loyalty visits
+- **Non-Member** = appears in transactions but not in loyalty
+
+Visit count comes from the full loyalty history, not the filtered date range, so a customer's tier is stable across views.
+
+#### Why some numbers might surprise you
+If your match rate is low, the most common reasons are: (1) the two exports cover different date ranges or locations, (2) plates are entered inconsistently between the kiosk and the POS, or (3) a meaningful share of customers don't enter their plate at the kiosk. If a section is empty or grey, check the data quality notes on the Dashboard.
+
+#### Loyalty vs Membership — what's the difference?
+These are two separate products and this page tracks both:
+- **Loyalty (kiosk rewards)** — a customer signs up at the kiosk and earns points for visits. Detected by their Mobile number appearing in your loyalty data.
+- **Membership (wash club subscription)** — a customer pays a monthly recurring fee for unlimited washes. Detected by a non-empty Membership Name in your transaction data.
+
+A customer can be in both, either, or neither. The Wash Club Membership section shows how many customers have made the jump to a paid subscription, and which loyalty members are your best upsell targets.
+
+#### What to do with this page
+Use it to (1) prove the dollar value of your loyalty program with the revenue-by-tier numbers, (2) prioritize membership upsell with the Hidden Opportunities list, and (3) identify locations or time periods where conversion is weakest. Export the Hidden Opportunities list to drive a campaign.
+
+#### Estimated OptSpot ROI
+The two numbers in the ROI section assume a typical wash ticket price you set at the top of the section. Adjust the price input to match your actual average ticket — the math recalculates instantly. Use these numbers to articulate the dollar value of converting retail customers into members AND driving more frequency from your existing retail base.
+
+#### Annualization
+Visit-per-customer metrics are scaled to a 365-day basis so the numbers are comparable across different export windows. If your data covers 6 months, the "annualized" average doubles the raw count. If your data covers 2 years, it halves it. The ROI section uses these annualized figures so the dollar estimates reflect full-year revenue impact.
+""")
+
+    data = _compute_cross_reference(df_loyalty, df_txn, date_start, date_end)
+    lp   = "license_plate_norm"
+
+    # Low-match warning
+    if 0 < data["match_rate"] < 0.10 and data["total_plates"] > 0:
+        st.warning(
+            f"Only {data['match_rate']:.1%} of plates matched between datasets. "
+            "Insights may be unreliable. Verify both exports cover the same locations and date range."
+        )
+
+    # ── SECTION D — Wash Club Membership Conversion ───────────────────────────
+    st.divider()
+    st.markdown(
+        '### Wash Club Membership Conversion '
+        '<span title="Your wash club conversion funnel — from total wash customers to loyalty enrolled to paid subscribers." '
+        'style="cursor:help;color:#A4D6F0;font-size:0.8em;">ⓘ</span>',
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        "Your customer's journey from one-time wash → loyalty signup → paid monthly membership. "
+        "The monthly subscription is the highest-value commitment a wash customer can make."
+    )
+
+    if not data["has_membership_col"]:
+        st.info(
+            "Wash Club analysis unavailable. Your transaction data is missing the Membership Name column. "
+            "Re-import with that column to unlock this section."
+        )
+    else:
+        paid_count   = data["paid_plates_count"]
+        total_p      = data["total_plates"]
+        enrolled_p   = data["member_plates"]
+        paid_pct     = paid_count / total_p if total_p else 0.0
+        enrolled_pct = enrolled_p / total_p if total_p else 0.0
+
+        # 3-stage KPI cards
+        d1, d2, d3 = st.columns(3)
+        d1.metric(
+            "Total Wash Customers", f"{total_p:,}",
+            help="Distinct vehicles seen in your wash transaction data.",
+        )
+        d2.metric(
+            "Loyalty Enrolled", f"{enrolled_p:,}",
+            delta=f"{enrolled_pct:.1%} of wash customers",
+            delta_color="normal",
+            help="Wash customers who also signed up for kiosk loyalty.",
+        )
+        d3.metric(
+            "Paid Members", f"{paid_count:,}",
+            delta=f"{paid_pct:.1%} of wash customers",
+            delta_color="normal",
+            help="Wash customers with a monthly wash club subscription, based on transactions tagged with a Membership Name.",
+        )
+
+        # Funnel bar (3 rows, narrowing to show drop-off)
+        if total_p > 0:
+            with st.container(border=True):
+                fig_wc = go.Figure()
+                for label, val, color in [
+                    ("Total Wash Customers", total_p,   LIGHTEST_BLUE),
+                    ("Loyalty Enrolled",     enrolled_p, MID_BLUE),
+                    ("Paid Members",         paid_count, PRIMARY_NAVY),
+                ]:
+                    pct = val / total_p * 100
+                    fig_wc.add_trace(go.Bar(
+                        x=[val], y=[label], orientation="h",
+                        marker_color=color,
+                        text=[f"{val:,}  ({pct:.1f}%)"],
+                        textposition="inside",
+                        insidetextanchor="middle",
+                        textfont=dict(color="#ffffff", size=12),
+                        showlegend=False,
+                    ))
+                fig_wc.update_layout(
+                    barmode="overlay",
+                    height=160,
+                    margin=dict(t=8, b=8, l=140, r=20),
+                    xaxis=dict(visible=False),
+                    yaxis=dict(tickfont=dict(size=12)),
+                    plot_bgcolor="rgba(0,0,0,0)",
+                    paper_bgcolor="rgba(0,0,0,0)",
+                )
+                st.plotly_chart(fig_wc, width="stretch")
+
+        # 2×2 crosstab matrix
+        st.markdown("#### Loyalty × Membership Crosstab")
+        st.caption(
+            "Not every customer follows the linear path. Some skip loyalty and go straight to a subscription. "
+            "This shows the full picture."
+        )
+        ct = data["crosstab"]
+        ct_total = total_p or 1
+
+        def _card(title, subtitle, count, bg, border_color,
+                  header_color, number_color, muted_color, accent_color):
+            pct = count / ct_total * 100
+            return (
+                f'<div style="background:{bg};border-left:4px solid {border_color};'
+                f'border-radius:8px;padding:24px;margin:6px 0;'
+                f'min-height:180px;box-sizing:border-box;">'
+                f'<div style="font-size:14px;font-weight:700;letter-spacing:0.5px;'
+                f'text-transform:uppercase;color:{header_color};margin-bottom:4px;">{title}</div>'
+                f'<div style="font-size:12px;font-weight:400;color:{muted_color};margin-bottom:12px;">{subtitle}</div>'
+                f'<div style="font-size:52px;font-weight:800;line-height:1.05;color:{number_color};margin-bottom:12px;">{count:,}</div>'
+                f'<div style="width:100%;height:6px;background:rgba(0,0,0,0.08);border-radius:4px;margin-bottom:6px;overflow:hidden;">'
+                f'<div style="width:{pct:.1f}%;height:100%;background:{accent_color};border-radius:4px;"></div>'
+                f'</div>'
+                f'<div style="font-size:12px;font-weight:500;color:{muted_color};">{pct:.1f}% of wash customers</div>'
+                f'</div>'
+            )
+
+        row1_l, row1_r = st.columns(2)
+        with row1_l:
+            st.markdown(
+                _card("Retail Only", "No loyalty · No membership",
+                      ct.get("retail_only", 0),
+                      bg="#f5f6f7", border_color="#4a5568",
+                      header_color="#1a202c", number_color="#1a202c",
+                      muted_color="#4a5568", accent_color="#4a5568"),
+                unsafe_allow_html=True,
+            )
+        with row1_r:
+            st.markdown(
+                _card("Loyalty Only", "Enrolled in loyalty · No membership",
+                      ct.get("loyalty_only", 0),
+                      bg="#f0f7ff", border_color=MID_BLUE,
+                      header_color=PRIMARY_NAVY, number_color=PRIMARY_NAVY,
+                      muted_color="rgba(30,58,107,0.75)", accent_color=MID_BLUE),
+                unsafe_allow_html=True,
+            )
+        row2_l, row2_r = st.columns(2)
+        with row2_l:
+            st.markdown(
+                _card("Member Only", "Subscribed · Not in loyalty",
+                      ct.get("member_only", 0),
+                      bg="#fff8e6", border_color="#f59e0b",
+                      header_color="#92400e", number_color="#92400e",
+                      muted_color="rgba(146,64,14,0.75)", accent_color="#f59e0b"),
+                unsafe_allow_html=True,
+            )
+        with row2_r:
+            st.markdown(
+                _card("Full Funnel", "Enrolled in loyalty + subscribed",
+                      ct.get("full_funnel", 0),
+                      bg="#e8efff", border_color=PRIMARY_NAVY,
+                      header_color=PRIMARY_NAVY, number_color=PRIMARY_NAVY,
+                      muted_color="rgba(30,58,107,0.75)", accent_color=PRIMARY_NAVY),
+                unsafe_allow_html=True,
+            )
+
+        # ── Crosstab drill-downs ───────────────────────────────────────────────
+        df_txn_f       = data["df_txn_f"]
+        af             = data["annualize_factor"]
+        has_sub        = data["has_subtotal"]
+        has_wd         = data["has_wash_date_col"]
+        lp_visits      = data["loyalty_plate_visits"]
+        plate_to_mobile = data["plate_to_mobile"]  # plate_norm → most recent Mobile
+
+        _QUADS = [
+            {
+                "key":         "retail_only",
+                "label":       "Retail Only — No loyalty, no membership",
+                "plates":      data["retail_only_plates"],
+                "color":       "#4a5568",
+                "has_loyalty": False,
+            },
+            {
+                "key":         "loyalty_only",
+                "label":       "Loyalty Only — Enrolled but not subscribed",
+                "plates":      data["loyalty_only_plates"],
+                "color":       MID_BLUE,
+                "has_loyalty": True,
+            },
+            {
+                "key":         "member_only",
+                "label":       "Member Only — Subscribed but not in loyalty",
+                "plates":      data["member_only_plates"],
+                "color":       "#f59e0b",
+                "has_loyalty": False,
+            },
+            {
+                "key":         "full_funnel",
+                "label":       "Full Funnel — Loyalty + subscription",
+                "plates":      data["full_funnel_plates"],
+                "color":       PRIMARY_NAVY,
+                "has_loyalty": True,
+            },
+        ]
+
+        def _build_quad_df(plates: set) -> pd.DataFrame:
+            """Build per-plate summary from df_txn_f for a given plate set."""
+            if not plates or lp not in df_txn_f.columns:
+                return pd.DataFrame()
+            seg = df_txn_f[df_txn_f[lp].isin(plates)].copy()
+            if seg.empty:
+                return pd.DataFrame()
+
+            agg: dict = {"Wash Visits": (lp, "count")}
+            if has_wd:
+                agg["Last Wash"] = ("wash_date", "max")
+            if has_sub:
+                seg["_sub"] = pd.to_numeric(seg.get("Subtotal", pd.Series(dtype=float)), errors="coerce").fillna(0)
+                agg["Total Spend"] = ("_sub", "sum")
+
+            out = seg.groupby(lp).agg(**agg).reset_index()
+            out.rename(columns={lp: "License Plate"}, inplace=True)
+
+            out["Loyalty Visits"] = out["License Plate"].map(lp_visits).fillna(0).astype(int)
+
+            if has_wd and "Last Wash" in out.columns:
+                out["Last Wash"] = pd.to_datetime(out["Last Wash"], errors="coerce")
+                today_ts = pd.Timestamp.today().normalize()
+                out["Days Since Wash"] = out["Last Wash"].apply(
+                    lambda d: int((today_ts - d).days) if pd.notna(d) else None
+                )
+                out["Last Wash"] = out["Last Wash"].dt.strftime("%Y-%m-%d")
+
+            if has_sub and "Total Spend" in out.columns:
+                out["Avg Spend / Visit"] = (out["Total Spend"] / out["Wash Visits"].replace(0, float("nan"))).round(2)
+
+            out = out.sort_values("Wash Visits", ascending=False).reset_index(drop=True)
+            return out
+
+        def _quad_seg_stats(plates: set) -> dict:
+            """Quick summary stats for a plate set."""
+            if not plates or lp not in df_txn_f.columns:
+                return {}
+            seg = df_txn_f[df_txn_f[lp].isin(plates)]
+            if seg.empty:
+                return {}
+            plate_counts = seg.groupby(lp).size()
+            avg_v = round(float(plate_counts.mean()) * af, 1)
+            stats = {"n": len(plates), "avg_visits_ann": avg_v}
+            if has_sub:
+                sub = pd.to_numeric(seg.get("Subtotal", pd.Series(dtype=float)), errors="coerce").fillna(0)
+                stats["avg_spend"] = round(sub.sum() / len(plates), 2) if plates else 0.0
+            if has_wd:
+                wd = pd.to_datetime(seg["wash_date"], errors="coerce").dropna()
+                if not wd.empty:
+                    today_ts = pd.Timestamp.today().normalize()
+                    last_by_plate = seg.assign(_wd=wd).groupby(lp)["_wd"].max()
+                    days_since = (today_ts - last_by_plate).dt.days
+                    stats["median_days_since"] = int(days_since.median())
+            return stats
+
+        st.markdown("##### Drill into a segment")
+        st.caption("Expand any quadrant to see per-plate details and top opportunities.")
+
+        for q in _QUADS:
+            q_plates = q["plates"]
+            n_plates = len(q_plates)
+            expander_label = f"{q['label']} — {n_plates:,} plates"
+            with st.expander(expander_label, expanded=False):
+                if n_plates == 0:
+                    st.info("No customers in this segment.")
+                    continue
+
+                stats = _quad_seg_stats(q_plates)
+
+                # Summary metrics row
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("Plates in Segment", f"{stats.get('n', 0):,}",
+                          help="Unique vehicles in this crosstab quadrant.")
+                m2.metric("Avg Visits / Plate (ann.)", f"{stats.get('avg_visits_ann', 0):.1f}",
+                          help="Average annual wash visits per plate. Scaled to 365 days from your data window.")
+                if has_sub and "avg_spend" in stats:
+                    m3.metric("Avg Spend / Plate", f"${stats['avg_spend']:,.2f}",
+                              help="Total subtotal divided by number of plates in this segment.")
+                else:
+                    m3.empty()
+                if has_wd and "median_days_since" in stats:
+                    m4.metric("Median Days Since Last Wash", f"{stats['median_days_since']:,}",
+                              help="Half of plates in this segment last washed more recently than this number, half less recently.")
+                else:
+                    m4.empty()
+
+                # Per-plate detail table
+                quad_df = _build_quad_df(q_plates)
+                if quad_df.empty:
+                    st.info("No transaction rows found for this segment.")
+                    continue
+
+                show_all_key = f"xref_drill_all_{q['key']}"
+                show_all = st.session_state.get(show_all_key, False)
+                display_n = len(quad_df) if show_all else min(20, len(quad_df))
+                display_df = quad_df.head(display_n)
+
+                _col_cfg: dict = {
+                    "License Plate":   st.column_config.TextColumn("License Plate", help="Normalized plate from transaction data."),
+                    "Wash Visits":     st.column_config.NumberColumn("Wash Visits", help="Total wash visits in the filtered date window."),
+                    "Loyalty Visits":  st.column_config.NumberColumn("Loyalty Visits", help="Lifetime kiosk check-ins in loyalty data."),
+                    "Days Since Wash": st.column_config.NumberColumn("Days Since Wash", help="Days elapsed since this plate's most recent wash."),
+                    "Last Wash":       st.column_config.TextColumn("Last Wash", help="Date of most recent wash transaction."),
+                    "Total Spend":     st.column_config.NumberColumn("Total Spend", format="$%.2f", help="Sum of Subtotal across all transactions for this plate."),
+                    "Avg Spend / Visit": st.column_config.NumberColumn("Avg Spend / Visit", format="$%.2f", help="Total Spend divided by Wash Visits."),
+                }
+
+                st.dataframe(
+                    display_df,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config=_col_cfg,
+                )
+
+                if not show_all and len(quad_df) > 20:
+                    if st.button(f"Show all {len(quad_df):,} plates", key=f"xref_drill_showall_{q['key']}"):
+                        st.session_state[show_all_key] = True
+                        st.rerun()
+                elif show_all and len(quad_df) > 20:
+                    if st.button("Show top 20 only", key=f"xref_drill_top20_{q['key']}"):
+                        st.session_state[show_all_key] = False
+                        st.rerun()
+
+                csv_df = quad_df.copy()
+                if q["has_loyalty"] and plate_to_mobile:
+                    csv_df.insert(1, "Mobile", csv_df["License Plate"].map(plate_to_mobile))
+                csv_bytes = csv_df.to_csv(index=False).encode("utf-8")
+                st.download_button(
+                    f"Download {q['key'].replace('_', ' ').title()} CSV",
+                    data=csv_bytes,
+                    file_name=f"crosstab_{q['key']}.csv",
+                    mime="text/csv",
+                    key=f"xref_drill_dl_{q['key']}",
+                )
+                st.caption(
+                    "This file contains full license plates and mobile numbers where available. "
+                    "Handle according to your privacy policy."
+                )
+
+        # Membership tier breakdown
+        membership_tier_df = data["membership_tier_df"]
+        if not membership_tier_df.empty:
+            st.markdown("#### Membership Tier Mix")
+            st.caption(
+                "Distribution of your paid members across subscription tiers. "
+                "The biggest tier is usually your entry-level offering — track upgrades over time."
+            )
+            total_paid = membership_tier_df["Members"].sum() or 1
+            fig_tiers = go.Figure()
+            fig_tiers.add_trace(go.Bar(
+                x=membership_tier_df["Members"].tolist(),
+                y=membership_tier_df["Tier Name"].tolist(),
+                orientation="h",
+                marker_color=MID_BLUE,
+                text=[
+                    f"{m:,} members ({m/total_paid*100:.1f}%)"
+                    for m in membership_tier_df["Members"]
+                ],
+                textposition="outside",
+                textfont=dict(size=11),
+            ))
+            fig_tiers.update_layout(
+                height=max(160, len(membership_tier_df) * 44 + 40),
+                margin=dict(t=20, b=20, l=160, r=20),
+                xaxis_title="Members (unique plates)",
+                xaxis=dict(visible=True),
+                yaxis=dict(autorange="reversed"),
+                plot_bgcolor="rgba(0,0,0,0)",
+                paper_bgcolor="rgba(0,0,0,0)",
+            )
+            with st.container(border=True):
+                st.plotly_chart(fig_tiers, width="stretch")
+
+            display_mt = membership_tier_df.copy()
+            display_mt["Loyalty Overlap"] = display_mt["Loyalty Overlap"].apply(
+                lambda v: f"{v:.1%}" if pd.notna(v) else "—"
+            )
+            _mt_col_cfg = {
+                "Tier Name":          st.column_config.Column("Tier Name",          help="Subscription plan name from your transaction data."),
+                "Members":            st.column_config.Column("Members",            help="Number of unique plates assigned to this tier."),
+                "Transactions":       st.column_config.Column("Transactions",       help="Total wash visits for plates in this tier."),
+                "Avg Visits / Member":st.column_config.Column("Avg Visits / Member",help="Average number of washes per subscriber in this tier."),
+                "Loyalty Overlap":    st.column_config.Column("Loyalty Overlap",    help="Share of plates in this tier who also enrolled in kiosk loyalty. Higher = your loyalty program is driving conversion to paid membership."),
+            }
+            with st.container(border=True):
+                st.dataframe(display_mt, use_container_width=True, hide_index=True,
+                             column_config=_mt_col_cfg)
+
+    # ── SECTION B — Revenue by Loyalty Tier ───────────────────────────────────
+    st.divider()
+    st.markdown(
+        '### Revenue by Loyalty Tier '
+        '<span title="How much each customer segment is worth in wash transactions. Loyalty tier is based on lifetime kiosk visits." '
+        'style="cursor:help;color:#A4D6F0;font-size:0.8em;">ⓘ</span>',
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        "What each customer segment is worth. "
+        "The revenue gap between tiers is the dollar value of retention."
+    )
+
+    tier_df = data["tier_df"]
+    has_sub = data["has_subtotal"]
+
+    if tier_df.empty:
+        st.info("Not enough matched data to build the revenue tier table.")
+    else:
+        if not has_sub:
+            st.caption(
+                "Subtotal column missing — showing visit volume only."
+            )
+
+        display_tier = tier_df.copy()
+        if has_sub:
+            for col in ["Total Revenue", "Avg Revenue / Plate", "Avg Revenue / Visit"]:
+                if col in display_tier.columns:
+                    display_tier[col] = display_tier[col].apply(
+                        lambda v: f"${v:,.2f}" if pd.notna(v) else "—"
+                    )
+
+        _tier_col_cfg = {
+            "Tier":               st.column_config.Column("Tier",               help="Customer segment. Based on lifetime loyalty visits."),
+            "Plates":             st.column_config.Column("Plates",             help="Number of unique vehicles in this tier."),
+            "Transactions":       st.column_config.Column("Transactions",       help="Total wash visits across all plates in this tier (within the filtered date range)."),
+            "Total Revenue":      st.column_config.Column("Total Revenue",      help="Sum of Subtotal across all transactions in this tier."),
+            "Avg Revenue / Plate":st.column_config.Column("Avg Revenue / Plate",help="Total Revenue divided by Plates. Average lifetime spend per customer in this tier."),
+            "Avg Revenue / Visit":st.column_config.Column("Avg Revenue / Visit",help="Total Revenue divided by Transactions. Average ticket size per wash visit in this tier."),
+        }
+        with st.container(border=True):
+            st.dataframe(display_tier, use_container_width=True, hide_index=True,
+                         column_config=_tier_col_cfg)
+
+        # Insight line
+        if has_sub and "Avg Revenue / Plate" in tier_df.columns:
+            vip_row = tier_df[tier_df["Tier"] == "VIP"]
+            nm_row  = tier_df[tier_df["Tier"] == "Non-Member"]
+            if not vip_row.empty and not nm_row.empty:
+                vip_val = vip_row["Avg Revenue / Plate"].iloc[0]
+                nm_val  = nm_row["Avg Revenue / Plate"].iloc[0]
+                if pd.notna(vip_val) and pd.notna(nm_val) and nm_val > 0:
+                    ratio = vip_val / nm_val
+                    st.markdown(
+                        f"**Insight:** Your VIPs spend **${vip_val:,.2f}** per plate vs "
+                        f"**${nm_val:,.2f}** for non-members — **{ratio:.1f}×** more value "
+                        "per loyal customer."
+                    )
+
+    # ── SECTION E — Members vs Retail behavioral comparison ───────────────────
+    if data["has_membership_col"] and data["members_vs_retail"]:
+        st.divider()
+        st.markdown(
+            '### Members vs Retail: How They Behave Differently '
+            '<span title="Side-by-side behavioral comparison between paying subscribers and retail wash customers." '
+            'style="cursor:help;color:#A4D6F0;font-size:0.8em;">ⓘ</span>',
+            unsafe_allow_html=True,
+        )
+        st.caption(
+            "Side-by-side behavioral comparison. Use this to articulate the business case for "
+            "converting more customers into subscribers."
+        )
+
+        _span     = data["span_days"]
+        _has_wd   = data["has_wash_date_col"]
+        _date_min = data["txn_date_min"]
+        _date_max = data["txn_date_max"]
+
+        if not _has_wd:
+            st.caption("wash_date missing — frequency metrics show raw counts, not annualized.")
+        else:
+            date_range_str = f" ({_date_min} – {_date_max})" if _date_min and _date_max else ""
+            st.caption(f"Frequency metrics annualized to 365 days. Your data covers {_span} days{date_range_str}.")
+            if _span < 30:
+                st.warning(
+                    f"Data covers only {_span} days. Annualized frequency numbers may not reflect "
+                    "typical customer behavior — consider uploading a longer transaction window for "
+                    "more reliable estimates."
+                )
+
+        mvr = data["members_vs_retail"]
+        seg_labels = [("members", "Paid Members"), ("retail", "Retail Customers")]
+
+        col_m, col_r = st.columns(2)
+        for col_widget, (seg_key, seg_label) in zip([col_m, col_r], seg_labels):
+            s = mvr.get(seg_key, {})
+            with col_widget:
+                st.markdown(f"**{seg_label}**")
+                if not s:
+                    st.caption("No data available for this segment.")
+                    continue
+
+                _avg_label = "Avg Visits per Plate (annualized)" if _has_wd else "Avg Visits per Plate"
+                _avg_help  = (
+                    f"Average visits per customer normalized to a one-year basis. "
+                    f"Your data covers {_span} days; we scale visit counts to 365 days "
+                    "so the number is comparable across different export windows."
+                    if _has_wd
+                    else f"How often a typical {seg_label.lower()} returns to wash."
+                )
+                st.metric(_avg_label, f"{s['avg_visits']:.1f}", help=_avg_help)
+
+                if s.get("top_days"):
+                    d0 = s["top_days"][0]
+                    st.metric(
+                        "Busiest Day",
+                        d0["name"],
+                        delta=f"{d0['pct']}% of washes",
+                        delta_color="off",
+                        help="When they're most likely to wash.",
+                    )
+                    if len(s["top_days"]) > 1:
+                        d1 = s["top_days"][1]
+                        st.caption(f"2nd: {d1['name']} ({d1['pct']}%)")
+
+                if s.get("time_bucket"):
+                    tb = s["time_bucket"]
+                    st.metric(
+                        "Preferred Time",
+                        tb["name"],
+                        delta=f"{tb['pct']}% of washes",
+                        delta_color="off",
+                        help="Their go-to wash window.",
+                    )
+
+                if s.get("median_span_days") is not None:
+                    st.metric(
+                        "Median Active Span",
+                        f"{s['median_span_days']} days",
+                        help="Median days between a customer's first and last visit — a proxy for long-term engagement.",
+                    )
+
+        # Insight callout
+        m_avg = mvr.get("members", {}).get("avg_visits") or 0
+        r_avg = mvr.get("retail",  {}).get("avg_visits") or 0
+        if r_avg > 0 and m_avg > 0:
+            ratio = m_avg / r_avg
+            if ratio >= 2:
+                insight_body = (
+                    f"Members visit <strong>{ratio:.1f}×</strong> more often than retail customers. "
+                    "This is the dollar value of converting a retail customer into a subscriber: "
+                    "significantly higher frequency, which compounds over a subscription's lifetime."
+                )
+            else:
+                insight_body = (
+                    f"Members visit <strong>{ratio:.1f}×</strong> more often than retail customers. "
+                    "Members and retail customers have similar visit frequencies — focus on increasing "
+                    "membership conversion rather than expecting retention lift from existing members."
+                )
+            st.markdown(
+                f'<div style="background:#e8eef7;border-left:4px solid {PRIMARY_NAVY};'
+                f'border-radius:6px;padding:16px 20px;margin-top:16px;color:#0a2540;">'
+                f'<strong>Insight:</strong> {insight_body}'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
+    # ── SECTION F — Estimated OptSpot ROI ─────────────────────────────────────
+    if data["has_membership_col"] and data["members_vs_retail"]:
+        st.divider()
+        st.markdown(
+            '### Estimated OptSpot ROI '
+            '<span title="Dollar-value estimates based on your customer behavior data and a configurable wash ticket price." '
+            'style="cursor:help;color:#A4D6F0;font-size:0.8em;">ⓘ</span>',
+            unsafe_allow_html=True,
+        )
+        st.caption(
+            "What's the dollar value of OptSpot's loyalty and membership programs? "
+            "Two scenarios based on your customer behavior data."
+        )
+
+        wash_price = st.number_input(
+            "Estimated avg wash ticket ($)",
+            min_value=1.00, max_value=100.00, value=12.00, step=0.50,
+            format="%.2f",
+            key="roi_wash_price",
+            help="Estimated price of a typical wash transaction. Used to convert visit-count differences into dollar amounts. Adjust to match your actual pricing.",
+        )
+
+        mvr          = data["members_vs_retail"]
+        member_avg   = mvr.get("members", {}).get("avg_visits") or 0.0
+        retail_avg   = mvr.get("retail",  {}).get("avg_visits") or 0.0
+        retail_count = mvr.get("retail",  {}).get("n_plates")   or 0
+        _roi_span    = data["span_days"]
+
+        if retail_count == 0:
+            st.info(
+                "All your wash customers are paid members. "
+                "No ROI lift to calculate from conversion or frequency."
+            )
+        else:
+            negative_lift    = (member_avg - retail_avg) < 0
+            visit_lift       = max(0.0, member_avg - retail_avg)
+            conversion_value = visit_lift * wash_price
+            converted        = max(1, round(retail_count * 0.10))
+            total_lift       = converted * conversion_value
+            one_extra        = retail_count * wash_price
+            two_extra        = retail_count * 2 * wash_price
+            combined_est     = total_lift + retail_count * 0.9 * wash_price
+            is_default_price = abs(wash_price - 12.00) < 0.01
+
+            card_a_style = (
+                f"background:#e8f4fd;border-left:4px solid {MID_BLUE};"
+                "border-radius:6px;padding:20px 24px;color:#0a2540;"
+            )
+            card_b_style = (
+                "background:#fff8e6;border-left:4px solid #f59e0b;"
+                "border-radius:6px;padding:20px 24px;color:#0a2540;"
+            )
+
+            col_a, col_b = st.columns(2)
+
+            with col_a:
+                default_note = ' <span style="font-size:12px;color:#666;">(based on $12 default — adjust above)</span>' if is_default_price else ""
+                _ann_note = f" (annualized from {_roi_span} days of data)" if _roi_span else ""
+                if negative_lift:
+                    big_num   = "$0.00"
+                    math_text = (
+                        f"Members in your data don't yet visit more than retail customers "
+                        f"({member_avg:.1f}× vs {retail_avg:.1f}× per year{_ann_note}) — "
+                        "possible data anomaly or early-program effect."
+                    )
+                    scale_text = ""
+                else:
+                    big_num   = f"${conversion_value:,.2f}"
+                    math_text = (
+                        f"Members visit {member_avg:.1f}× per year vs retail at {retail_avg:.1f}× "
+                        f"per year{_ann_note}. At ${wash_price:.2f} per wash, each conversion = "
+                        f"{visit_lift:.1f} extra visits/yr × ${wash_price:.2f} = ${conversion_value:.2f}/year."
+                    )
+                    scale_text = (
+                        f"<p style='font-size:13px;margin-top:10px;'>"
+                        f"If you converted just 10% of your {retail_count:,} retail customers "
+                        f"({converted:,} people), the total annual lift would be approximately "
+                        f"<strong>${total_lift:,.0f}</strong>.</p>"
+                    )
+                st.markdown(
+                    f'<div style="{card_a_style}">'
+                    f'<div style="font-size:11px;font-weight:700;letter-spacing:0.08em;color:{MID_BLUE};margin-bottom:6px;">PER-CONVERSION VALUE</div>'
+                    f'<div style="font-size:32px;font-weight:800;margin-bottom:2px;">{big_num}{default_note}</div>'
+                    f'<div style="font-size:13px;margin-bottom:10px;">in additional annual wash revenue, per retail customer converted to a monthly member.</div>'
+                    f'<div style="font-size:12px;color:#555;">{math_text}</div>'
+                    f'{scale_text}'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+
+            with col_b:
+                st.markdown(
+                    f'<div style="{card_b_style}">'
+                    f'<div style="font-size:11px;font-weight:700;letter-spacing:0.08em;color:#b45309;margin-bottom:6px;">PER-EXTRA-VISIT VALUE</div>'
+                    f'<div style="font-size:32px;font-weight:800;margin-bottom:2px;">${one_extra:,.0f}</div>'
+                    f'<div style="font-size:13px;margin-bottom:10px;">in additional annual wash revenue if every retail customer visited just ONE more time.</div>'
+                    f'<div style="font-size:12px;color:#555;">You have {retail_count:,} retail customers. '
+                    f'At ${wash_price:.2f} per wash, +1 visit each = ${one_extra:,.0f}. '
+                    f'+2 visits each = ${two_extra:,.0f}. '
+                    f'Based on retail customer counts in the current data period.</div>'
+                    f'<p style="font-size:13px;margin-top:10px;">Loyalty engagement and timely text offers drive return visits — '
+                    f"that's OptSpot's core deliverable.</p>"
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+
+            st.markdown(
+                f'<div style="background:#e8f4fd;border-left:4px solid {MID_BLUE};'
+                f'border-radius:6px;padding:16px 20px;margin-top:16px;color:#0a2540;">'
+                f'<strong>Combined upside:</strong> converting 10% of retail to membership + driving 1 extra visit '
+                f'from the rest could deliver approximately <strong>${combined_est:,.0f}</strong> in annual wash revenue. '
+                f"This is what OptSpot's loyalty engagement is built to deliver."
+                f'</div>',
+                unsafe_allow_html=True,
+            )
 
 
 def _load_dispatch_log():
@@ -3055,16 +4349,9 @@ def page_dispatcher():
             st.rerun()
 
 
-def page_import():
-    st.header("Import Files")
-    st.caption("Upload your loyalty export CSV to get started.")
-    st.divider()
-    render_status_line()
-
+def _render_loyalty_import_tab():
     if "import_success_msg" in st.session_state:
-        msg = st.session_state["import_success_msg"]
-        del st.session_state["import_success_msg"]
-        st.success(msg)
+        st.success(st.session_state.pop("import_success_msg"))
         if "import_source_files" in st.session_state:
             st.caption(f"Source files: {st.session_state.pop('import_source_files')}")
 
@@ -3073,12 +4360,12 @@ def page_import():
         type=["csv"],
         accept_multiple_files=True,
         help="All files must have the same column structure. Rows from all files will be merged.",
+        key="loyalty_uploader",
     )
 
     if not uploaded_files:
         return
 
-    # ── Read all files ────────────────────────────────────────────────────────
     dfs = []
     for f in uploaded_files:
         try:
@@ -3092,8 +4379,7 @@ def page_import():
         st.error("No files could be read. Check that all uploads are valid CSVs.")
         return
 
-    # ── Per-file summary ──────────────────────────────────────────────────────
-    ref_cols = set(dfs[0][1].columns.str.lower())
+    ref_cols   = set(dfs[0][1].columns.str.lower())
     total_rows = sum(len(df) for _, df in dfs)
 
     rows_html = ""
@@ -3124,7 +4410,6 @@ def page_import():
     n = len(dfs)
     st.caption(f"{n} file{'s' if n > 1 else ''} • {total_rows:,} total rows")
 
-    # ── Schema validation (skip for single file) ──────────────────────────────
     if len(dfs) > 1:
         mismatches = [
             (name, df.columns.tolist())
@@ -3138,9 +4423,9 @@ def page_import():
             )
             for name, cols in mismatches:
                 their_cols = set(c.lower() for c in cols)
-                only_ref   = ref_cols - their_cols
+                only_ref    = ref_cols - their_cols
                 only_theirs = their_cols - ref_cols
-                diff_parts = []
+                diff_parts  = []
                 if only_ref:
                     diff_parts.append(f"missing: {', '.join(sorted(only_ref))}")
                 if only_theirs:
@@ -3148,7 +4433,6 @@ def page_import():
                 st.caption(f"**{name}** — {'; '.join(diff_parts)}")
             return
 
-    # ── Preview from first file ───────────────────────────────────────────────
     first_name, first_df = dfs[0]
     st.subheader("Column Mapping")
     st.write(
@@ -3156,12 +4440,11 @@ def page_import():
         f"(rows from all files will be processed the same way)."
     )
     st.dataframe(first_df.head(5), width="stretch")
-
     st.write("Map columns to the OptSpot schema. Auto-matched where column names align.")
 
-    file_cols = list(first_df.columns)
+    file_cols    = list(first_df.columns)
     col_left, col_right = st.columns(2)
-    mapping = {}
+    mapping      = {}
 
     for i, field in enumerate(SCHEMA_FIELDS):
         is_optional   = field in OPTIONAL_SCHEMA_FIELDS
@@ -3173,10 +4456,7 @@ def page_import():
         target_col    = col_left if i % 2 == 0 else col_right
         with target_col:
             selected = st.selectbox(
-                display_label,
-                options,
-                index=default_idx,
-                key=f"map_{field}",
+                display_label, options, index=default_idx, key=f"map_{field}",
             )
             if selected not in ("-- not mapped --", "(optional / not available)"):
                 mapping[field] = selected
@@ -3185,9 +4465,7 @@ def page_import():
     mode = st.radio(
         "Import Mode",
         ["Replace all data", "Append to existing data"],
-        index=0,
-        horizontal=True,
-        label_visibility="collapsed",
+        index=0, horizontal=True, label_visibility="collapsed",
     )
 
     if st.button("Process Import", type="primary"):
@@ -3199,17 +4477,18 @@ def page_import():
         mapped_df = pd.DataFrame({field: combined[col] for field, col in mapping.items()})
         mapped_df = split_datetime_column(mapped_df)
 
+        if "License Plate" in mapped_df.columns:
+            mapped_df["license_plate_norm"] = mapped_df["License Plate"].apply(normalize_plate)
+
         existing = st.session_state.get("loaded_data")
         if mode == "Append to existing data" and existing is not None:
             final_df = pd.concat([existing, mapped_df], ignore_index=True)
         else:
             final_df = mapped_df
 
-        st.session_state["loaded_data"] = final_df
-        final_df.to_csv(
-            os.path.join(os.path.dirname(os.path.abspath(__file__)), "current_data.csv"),
-            index=False,
-        )
+        st.session_state["loaded_data"]    = final_df
+        st.session_state["outlier_mobiles"] = identify_outlier_mobiles(final_df)
+        final_df.to_csv(os.path.join(_APP_DIR, "current_data.csv"), index=False)
 
         n_files = len(dfs)
         st.session_state["auto_loaded"]        = False
@@ -3220,11 +4499,10 @@ def page_import():
         st.session_state["import_source_files"] = ", ".join(name for name, _ in dfs)
         st.rerun()
 
-    # ── Clear loaded data ─────────────────────────────────────────────────────
     st.markdown("---")
     st.caption("Danger zone")
     if st.button("Clear loaded data", type="secondary"):
-        _curr = os.path.join(os.path.dirname(os.path.abspath(__file__)), "current_data.csv")
+        _curr = os.path.join(_APP_DIR, "current_data.csv")
         if os.path.exists(_curr):
             os.remove(_curr)
         st.session_state.pop("loaded_data", None)
@@ -3232,14 +4510,169 @@ def page_import():
         st.rerun()
 
 
+def _render_txn_import_tab():
+    st.write(
+        "Upload your POS or wash management system's transaction export to unlock "
+        "Cross-Reference Insights. Joined to loyalty data on license plate."
+    )
+
+    if "import_txn_success_msg" in st.session_state:
+        st.success(st.session_state.pop("import_txn_success_msg"))
+
+    uploaded = st.file_uploader(
+        "Upload one or more CSV files",
+        type=["csv"],
+        accept_multiple_files=True,
+        key="txn_uploader",
+    )
+
+    if not uploaded:
+        return
+
+    dfs = []
+    for f in uploaded:
+        try:
+            df = pd.read_csv(f, index_col=False)
+            df.drop(columns=[c for c in TXN_DROP_COLS if c in df.columns],
+                    errors="ignore", inplace=True)
+            dfs.append((f.name, df))
+        except Exception:
+            st.warning(f"Could not read **{f.name}** — skipping.")
+
+    if not dfs:
+        st.error("No files could be read.")
+        return
+
+    total_rows = sum(len(df) for _, df in dfs)
+    rows_html  = ""
+    ref_cols   = set(dfs[0][1].columns.str.lower())
+    for name, df in dfs:
+        file_cols_set = set(df.columns.str.lower())
+        status = (
+            '<span style="color:#2e7d32;">✓</span>'
+            if file_cols_set == ref_cols or len(dfs) == 1
+            else '<span style="color:#c62828;">⚠ Different columns</span>'
+        )
+        rows_html += (
+            f"<tr><td style='padding:4px 10px 4px 0;'>{_html.escape(name)}</td>"
+            f"<td style='padding:4px 10px 4px 0;text-align:right;'>{len(df):,}</td>"
+            f"<td style='padding:4px 0;'>{status}</td></tr>"
+        )
+    st.markdown(
+        f"""<table style="font-size:13px;border-collapse:collapse;width:auto;">
+          <thead><tr>
+            <th style="padding:4px 10px 4px 0;text-align:left;color:#555;">File</th>
+            <th style="padding:4px 10px 4px 0;text-align:right;color:#555;">Rows</th>
+            <th style="padding:4px 0;color:#555;">Status</th>
+          </tr></thead><tbody>{rows_html}</tbody></table>""",
+        unsafe_allow_html=True,
+    )
+    n = len(dfs)
+    st.caption(f"{n} file{'s' if n > 1 else ''} • {total_rows:,} total rows  (PII columns removed)")
+
+    first_name, first_df = dfs[0]
+
+    lp_found = any(
+        c.strip().lower() in TXN_COLUMN_ALIASES["license_plate"]
+        for c in first_df.columns
+    )
+    if not lp_found:
+        st.error(
+            "license_plate column not detected — this is the join key for Cross-Reference. "
+            "Map it below or verify your export includes it."
+        )
+
+    st.subheader("Column Mapping")
+    st.write(f"Preview from **{first_name}** (PII columns already removed).")
+    st.dataframe(first_df.head(5), use_container_width=True)
+
+    file_cols    = list(first_df.columns)
+    col_left, col_right = st.columns(2)
+    mapping      = {}
+    for i, field in enumerate(TXN_SCHEMA_FIELDS):
+        is_required = field in TXN_REQUIRED_FIELDS
+        placeholder = "-- not mapped --"
+        options     = [placeholder] + file_cols
+        auto        = _txn_auto_match(file_cols, field)
+        default_idx = options.index(auto) if auto else 0
+        with (col_left if i % 2 == 0 else col_right):
+            selected = st.selectbox(
+                f"{field}{' *' if is_required else ''}",
+                options, index=default_idx,
+                key=f"txn_map_{field}",
+            )
+            if selected != placeholder:
+                mapping[field] = selected
+
+    st.subheader("Import Mode")
+    mode = st.radio(
+        "Transaction Import Mode",
+        ["Replace all data", "Append to existing data"],
+        index=0, horizontal=True, label_visibility="collapsed",
+        key="txn_import_mode",
+    )
+
+    can_import = "license_plate" in mapping
+    if not can_import:
+        st.warning("Map the license_plate column to continue.")
+
+    if st.button("Process Import", type="primary", key="txn_process_btn",
+                 disabled=not can_import):
+        combined   = pd.concat([df for _, df in dfs], ignore_index=True)
+        rename_map = {v: k for k, v in mapping.items() if v != k}
+        combined.rename(columns=rename_map, inplace=True)
+        keep   = [c for c in TXN_SCHEMA_FIELDS if c in combined.columns]
+        txn_df = combined[keep].copy()
+
+        if "license_plate" in txn_df.columns:
+            txn_df["license_plate_norm"] = txn_df["license_plate"].apply(normalize_plate)
+
+        existing = st.session_state.get("transaction_data")
+        if mode == "Append to existing data" and existing is not None:
+            txn_df = pd.concat([existing, txn_df], ignore_index=True)
+
+        st.session_state["transaction_data"] = txn_df
+        try:
+            txn_df.to_csv(TXNDATA_PATH, index=False)
+        except Exception:
+            st.warning("Saved in-session only — disk write failed.")
+
+        n_files = len(dfs)
+        st.session_state["import_txn_success_msg"] = (
+            f"Imported {len(txn_df):,} transaction rows from "
+            f"{n_files} file{'s' if n_files > 1 else ''}."
+        )
+        st.rerun()
+
+    st.markdown("---")
+    st.caption("Danger zone")
+    if st.button("Clear transaction data", type="secondary", key="txn_clear_btn"):
+        if os.path.exists(TXNDATA_PATH):
+            os.remove(TXNDATA_PATH)
+        st.session_state.pop("transaction_data", None)
+        st.rerun()
+
+
+def page_import():
+    st.header("Import Files")
+    st.caption("Upload loyalty and wash transaction data.")
+    st.divider()
+    render_status_line()
+
+    tab_loyalty, tab_txn = st.tabs(["Loyalty Data", "Wash Transaction Data (optional)"])
+    with tab_loyalty:
+        _render_loyalty_import_tab()
+    with tab_txn:
+        _render_txn_import_tab()
+
 # ── Router ────────────────────────────────────────────────────────────────────
 
 if page == "Dashboard":
     page_dashboard()
 elif page == "Retention":
     page_retention()
-elif page == "Directory":
-    page_directory()
+elif page == "Cross-Reference":
+    page_cross_reference()
 elif page == "Dispatcher":
     page_dispatcher()
 elif page == "Import Files":
